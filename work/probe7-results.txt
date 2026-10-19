@@ -1,0 +1,9 @@
+=== A1/A2 重复完整形态（看 pay-view 是否持续）===
+A1 full                                -> 200  len=556   {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"OK","reasoning_content":"The user is asking me to reply with o
+A2 full (3s later)                     -> 200  len=540   {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"OK","reasoning_content":"The user wants me to reply with just 
+=== F. 去掉 X-Auth-Sign 族（测是否门禁）===
+F no X-Auth-Sign                       -> 200  len=553   {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"OK","reasoning_content":"The user asked me to reply with one w
+=== H. 去掉 X-Session-Id / X-Agent-Id ===
+H no session/agent id                  -> 200  len=559   {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"OK","reasoning_content":"The user is asking me to reply with o
+=== I. 去掉 X-Request-Model ===
+I no X-Request-Model                   -> 400  len=18    {"message":"非法模型"}

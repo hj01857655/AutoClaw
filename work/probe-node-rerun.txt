@@ -1,0 +1,10 @@
+=== A. 只删 max_tokens（system 用 2.x banner）===
+A banner, no max_tokens            -> 403   len=207  {"action":{"kind":"pay-view"},"code":810001,"image_url":"https://autoglm-agent.aminer.cn/auto_fly/513957c6-e001-4911-a738-7e8cd040eea7/Frame2147261831.png","mes
+=== B. 无 system（检验 banner 是否必需）===
+B no system                        -> 406   len=0  
+=== C. 带 max_tokens=32（复现第一轮的 406）===
+C banner + max_tokens=32           -> 406   len=0  
+=== D. 完整形态 + 外来 harness 身份句（测 406 denylist）===
+D + "You are Claude Code"          -> 406   len=0  
+=== E. 完整形态 + OpenAI/JS UA ===
+E banner + OpenAI/JS UA            -> 200   len=524  {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"OK","reasoning_content":"The user wants me to reply with one word: \"OK\". Simple instructio

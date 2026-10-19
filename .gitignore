@@ -1,0 +1,82 @@
+# ============================================================
+# AutoClaw 逆向仓库 .gitignore
+# 原则：运行时产物与真实凭据一律不入库
+# ============================================================
+
+# --- 环境变量与真实凭据 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.der
+*.enc
+*.jks
+*.keystore
+
+# --- 运行时日志（含请求/响应原文，不落 header 也可能带上下文）---
+*.log
+boot.err
+boot.out
+nohup.out
+logs/
+
+# --- 请求/响应转储 ---
+dumps/
+*.req.txt
+*.resp.txt
+
+# --- Chromium profile 与加密凭据（本仓库只存解密方法，不存密文）---
+Local State
+Cookies
+Login Data
+Web Data
+History
+Preferences
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- OS / 编辑器 ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble/
+.LSOverride
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- 打包与临时文件 ---
+dist/
+build/
+*.tmp
+*.temp
+*.bak
+*.orig

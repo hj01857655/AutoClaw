@@ -1,0 +1,8 @@
+# 运行时产物——里面可能有请求/响应原文，别提交
+*.log
+dumps/
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/

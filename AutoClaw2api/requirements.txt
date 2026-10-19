@@ -1,0 +1,7 @@
+flask>=3.0
+requests>=2.31
+python-dotenv>=1.0
+# Windows 凭据解密：DPAPI + AES-256-GCM。仅 Windows 可用，其它平台会给出
+# 明确报错而不是静默失败——AutoClaw 的凭据本来就绑死 Windows 同用户身份。
+pywin32>=306; sys_platform == "win32"
+cryptography>=42.0

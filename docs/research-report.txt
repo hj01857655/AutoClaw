@@ -1,0 +1,309 @@
+# AutoClaw 积分反代可行性研究报告
+
+**把 AutoClaw 客户端积分转成 OpenAI 兼容接口，供其他 agent 使用**
+
+日期：2026-09-14　 平台：macOS (arm64)　 AutoClaw 1.18.1　 范围：本机实测 + 公开源码分析
+
+---
+
+## 0. 结论摘要
+
+**可行，已在你的机器上跑通。** 但「直连云端」有一组此前没被公开说明的隐性门禁：除了鉴权头，上游还要求① UA 不被前置 WAF 拦（`Python-urllib/*` 会被 405）、② 请求头 `X-Request-Model` 必须是合法模型 id、③ 请求体的 system 提示词中必须包含特定的 OpenClaw 开场文案——三者任一不满足都会被 400 拒绝。逐条对齐后，自研轻量反代（单文件、零依赖）端到端冒烟 4/4 通过：非流式、流式、多轮、模型别名全部正常，积分从你的 AutoClaw 账户正常扣减。
+
+| 判定项 | 结论 |
+|---|---|
+| 技术上是否可行 | ✅ 可行，本机已实测跑通 |
+| 是否需要破解加密凭证 | ❌ 不需要。JWT 明文存放在本机动态凭证文件，桌面端自动刷新 |
+| 主要障碍 | 上游多道准入判定（WAF/UA、`X-Request-Model` 合法性、system banner），本报告逐条定位并验证 |
+| 推荐路线 | 路线 A：自研轻量反代（本报告交付）；路线 B：现成社区项目 glmproxy |
+| 最大风险 | 非官方客户端用法存在风控/条款风险；上游契约变更会使反代再次 400 |
+
+**核心事实链**（全部有本机日志/实测支撑）：
+
+1. AutoClaw 桌面端所有模型调用都走 `https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw/chat/completions`（OpenAI `chat/completions` 协议，积分制、`cost` 全 0）。
+2. 鉴权 = 请求头 `X-Authorization: Bearer <JWT>` + 一组固定客户端身份头；JWT 明文存放在 `~/.openclaw-autoclaw/request-headers.json`，由桌面端随登录态刷新（实测有效期约 24 小时，文件变更即被读取）。
+3. 上游对「官方客户端」做多重准入判定：UA 需过前置 WAF；请求头 `X-Request-Model` 必须是合法模型 id；system 提示词必须含 `You are a personal assistant running inside OpenClaw.\n## Tooling`（精确两行）。三者任一缺失都会被 400 拒绝——这解释了为什么裸请求、官方 CLI 独立调用全部失败，而网关的 agent 会话正常。
+4. 模型路由由请求头 `X-Request-Model`（完整 id）决定；请求体里的模型名上游不校验，反代默认去前缀（`zai_auto` → `auto`）仅为对齐官方客户端习惯。
+
+---
+
+## 1. 背景与目标
+
+**目标**：研究能否把 AutoClaw 客户端内消费的模型积分「反代」成 OpenAI 兼容 API，供其他 agent 工具（OpenAI SDK、aider、Cline、LangChain、OpenCode 等）使用。
+
+**参考项目**：[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) —— 把各类 CLI 工具（Gemini CLI、Codex、Claude Code 等）的凭证包装成 OpenAI / Anthropic / Gemini 兼容 API 的 Go 项目。本次研究的核心问题是：同样的思路能不能用在 AutoClaw 上，以及复用 CLIProxyAPI 需要改什么。
+
+**为什么值得做**：AutoClaw 的积分是包月/活动赠送的额度（本机日志可见「登陆赠送 5000 积分」等活动配置），模型成本字段全 0，实际是按积分计费而非按 token 计费。对自用者而言，把这部分额度开放给本机其他工具，边际成本接近零。
+
+---
+
+## 2. 积分与凭证链路解剖
+
+### 2.1 调用链
+
+```
+其他 agent 工具 ──▶ 本机反代 ──▶ AutoClaw 云端（积分扣减）
+                      │
+                      └── 凭证来源：~/.openclaw-autoclaw/request-headers.json（桌面端刷新）
+```
+
+三层的职责分工：
+
+1. **桌面端（Electron）**：维护登录态，定期把新鲜的 `X-Authorization` JWT 写进 `request-headers.json`；同时把模型目录写进 `openclaw.json` / `openclaw.runtime.json`。
+2. **本机网关（OpenClaw，端口 18789）**：真正的模型调用方，每次请求前重读动态凭证文件，组装 AutoClaw 出站契约头（请求 ID / 会话 ID / Agent ID / 客户端身份头），并注入完整 OpenClaw 系统提示词。网关侧这段逻辑在运行时产物里的 `autoclaw-outbound-context` 模块，函数名可检索：`readAutoClawDynamicRequestHeaders`、`buildAutoClawRequestHeaders`、`rewriteAutoClawJsonRequestBody`。
+3. **云端（autoglm-api.autoglm.ai）**：鉴权 + 配额 + 路由。模型由云端智能路由（`zai_auto` 实测被路由到 `deepseek/deepseek-v4-flash-vision-exp`）。
+
+### 2.2 凭证文件
+
+| 文件 | 内容 | 谁写 | 反代怎么用 |
+|---|---|---|---|
+| `~/.openclaw-autoclaw/request-headers.json` | `headers.X-Authorization`（新鲜 JWT）+ `sessionHeaders` | 桌面端 | 每次请求前读取（mtime 缓存），拿到最新 token |
+| `~/.openclaw-autoclaw/openclaw.json` | 模型表、上游 baseUrl、客户端身份头（X-Tm/X-Version/…） | 桌面端 | 读模型清单与身份头 |
+| `~/.openclaw-autoclaw/openclaw.runtime.json` | 运行时叠加：同样含模型表（可能比 base 更新） | 桌面端 | 备选模型目录来源 |
+| `~/Library/Application Support/autoclaw/auth.json` | 加密的 token/refreshToken（`enc:` 前缀）+ userInfo | 桌面端 | 不需要；反代不碰 |
+| `~/.openclaw-autoclaw/.gateway-token` | 本机网关的 operator token | 桌面端 | 仅在走「网关自带 OpenAI 端点」路线时需要 |
+
+**关键设计：反代不复制、不落盘凭证**，只从桌面端维护的文件里按请求读取。这样桌面端刷新登录态后反代自动跟随，无需重启。
+
+### 2.3 上游出站契约（逆向所得）
+
+| 项 | 值 |
+|---|---|
+| 端点 | `POST {baseUrl}/chat/completions`，baseUrl = `https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw` |
+| 凭证头 | `X-Authorization: Bearer <JWT>` |
+| 模型头 | `X-Request-Model: <完整模型 id>`（如 `zai_auto`）——**路由由它决定** |
+| 模型体 | `model: <去前缀名>`（如 `auto`）——上游不校验，仅为对齐官方客户端习惯 |
+| 追踪头 | `X-Request-Id: <uuid4>`、`X-Agent-Id: main`、`X-Session-Id`、`X-Session-Key` |
+| 身份头 | `X-Tm`、`X-Version`、`X-Product: autoclaw`、`X-Channel: zai`、`X-Lang`、`X-Client-Type: pc`、`x_trace_id: autoclaw-desktop` |
+| 系统提示词 | **必须含** `You are a personal assistant running inside OpenClaw.\n## Tooling` |
+| 附带能力 | `stream` + `stream_options.include_usage`；`enable_thinking`；`reasoning_content`（assistant 消息可带） |
+
+---
+
+## 3. 关键发现：上游的三重准入判定
+
+### 3.1 现象
+
+直接按「凭证 + 头 + 标准 OpenAI 请求体」向上游发请求，得到的是 400。这现象同时出现在：
+
+- 自研反代的初版实现；
+- 官方 OpenClaw CLI 的独立调用（`openclaw infer model run`，网关 trace 日志里 `xSessionId=- xAgentId=-`）；
+- 各路探针组合（换 UA、换 HTTP 库、加会话头、加 AgentTeam/AgentMode、带/不带 Authorization、模型名各种写法，共 6 轮矩阵、30+ 组合）。
+
+而网关自己的 agent 会话（带完整系统提示词）同参数 200。逐层排查后定位到三道相互独立的门禁（由独立复核员用对照实验确认，见 `evidence/independent_review.md`）。
+
+### 3.2 三道门禁（均为必要条件）
+
+| # | 门禁 | 规则 | 违反时表现 |
+|---|---|---|---|
+| ① | User-Agent / WAF | 前置阿里云 WAF 拦 `Python-urllib/*` 等 UA | `405`（HTML 拦截页） |
+| ② | `X-Request-Model` | 必须存在，且为上游认可的合法模型 id | `400 {"message":"非法模型"}` |
+| ③ | system banner | system 消息须包含精确两行 `You are a personal assistant running inside OpenClaw.\n## Tooling`（缺任一行都不过） | `400 {"message":"invalid request"}` |
+
+### 3.3 对照实验（摘录）
+
+同一套头、同一凭证，唯一变量是 system 内容：
+
+| 变体 | 结果 |
+|---|---|
+| 无 system（仅 user） | **400** `invalid request` |
+| 完整 banner 作 system | **200** 返回真实补全 |
+| 有 system 但无 banner | **400** `invalid request` |
+| 仅 `## Tooling` 一行 / 去掉该行 | **400** `invalid request` |
+
+固定 banner、只改 `X-Request-Model`：
+
+| `X-Request-Model` | body.model | 结果 |
+|---|---|---|
+| `zai_auto` | `auto` | **200** |
+| 缺失 | `auto` | **400** `非法模型` |
+| `totally_bogus` | `auto` | **400** `非法模型` |
+| `zai_auto` | `zai_auto`（带前缀） | **200**（body 不参与路由校验） |
+| `zai_glm-5-turbo`（runtime 独有） | `auto` | **400** `非法模型`（该 id 实为不可用） |
+
+### 3.4 结论与边界
+
+- 三道门禁均有对照实验证据；**banner 是必要条件之一，不是唯一门槛**。
+- body.model 不参与路由校验，去前缀仅为对齐官方习惯。
+- 未验证的维度：TLS/JA3 指纹是否另有规则、频率/并发策略、`max_tokens` 超限「静默换模型计费」（后者来自社区项目记录，本机未独立复现，标记待验证）。本文未尝试规避风控，全部结论来自本机自有账号的正常调用。
+
+---
+
+## 4. 方案对比
+
+| 路线 | 做法 | 优点 | 缺点 | 本机验证 |
+|---|---|---|---|---|
+| **A. 自研轻量反代**（本报告交付 `proxy.py`） | 单文件 Python，读动态凭证，注入 banner，转发上游，SSE 透传 | 零依赖、可读、可改、绑定回环、凭证不落盘 | 单账号无轮询；上游变更需自行再对齐 | ✅ 冒烟 4/4 |
+| **B. 社区项目 glmproxy** | `npm i -g glmproxy`，读同一 token 文件，云端优先 + 本地网关 WebSocket 降级 | 成熟：OpenAI + Anthropic 双格式、健康检查、速率限制、模型目录热读 | 第三方依赖；降级路径会驱动本机网关跑 agent（开销大） | ✅ 本机实测成功（云端 200 / 降级可用） |
+| **C. CLIProxyAPI 自定义 provider** | 用 `openai-compatibility` 注册 AutoClaw 为上游，配 `base-url` + `headers` | 复用其多协议翻译、多账号、多 provider 管理 | `headers` 是**静态 map**，不读动态凭证、不自动刷新 JWT，需要外部薄壳注入 token；且仍需 banner 注入（CLIProxyAPI 不改 body） | ⚠️ 配置可行，未逐项实测 |
+| **D. 网关自带 OpenAI HTTP 端点** | 开启 `gateway.http.endpoints.chatCompletions.enabled`，用网关 token 调 `/v1/chat/completions` | **官方支持**，稳定；含 `/v1/models` `/v1/embeddings` `/v1/responses`；走完整 agent 运行时（带工具、会话） | 默认关闭，需改配置；语义是「agent 目标」而非裸模型；开销大于直连；需 operator 级 token | ⚠️ 端点实测为关闭状态（返回控制台页面） |
+
+**选择建议**：只要裸模型调用、追求轻量 → 路线 A；要 Anthropic 格式或需要降级保险 → 路线 B；已有 CLIProxyAPI 集群、需要统一网关 → 路线 C + 一个 token 注入薄壳；想让其他工具获得「带工具的 agent」而不仅是「模型」 → 路线 D。
+
+---
+
+## 5. 交付与验证
+
+### 5.1 交付物
+
+- `autoclaw-credit-proxy/proxy.py` —— 反代主体（零依赖，Python ≥ 3.9）
+- `autoclaw-credit-proxy/smoke_test.sh` —— 冒烟测试（4 项）
+- `autoclaw-credit-proxy/README.md` —— 使用文档、机制说明、风险提示
+- 本报告（Markdown + HTML）
+
+### 5.2 验证记录
+
+启动与自检：
+
+```bash
+export PYTHONPATH=""
+cd autoclaw-credit-proxy
+python3 proxy.py            # → autoclaw-credit-proxy 启动: http://127.0.0.1:8787
+bash smoke_test.sh http://127.0.0.1:8787
+```
+
+冒烟结果（原始日志见 `evidence/smoke_v2.log`）：
+
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | `GET /healthz`（模型清单 / token 到期 / 上游地址） | PASS |
+| 2 | `GET /v1/models`（6 个真实模型 + 7 个别名） | PASS |
+| 3 | `POST /v1/chat/completions` 非流式 + 别名解析（`gpt-4o`→`zai_auto`），upstream=200 | PASS |
+| 4 | `POST /v1/chat/completions` 流式 + 多轮（assistant 缺 `reasoning_content` 自动注入），upstream=200 | PASS |
+
+旁证：
+
+- **独立复核员单机复现**：以副本端口独立启动同一反代并跑完全部冒烟，结果同样 4/4 PASS；并用对照实验逐一确认三道门禁（见 `evidence/independent_review.md`）。
+- 网关成功请求 trace（`evidence/gateway_200_traces.txt`）：`status=200 … xSessionId=… xAgentId=main xAgentTeam=1 xProduct=autoclaw`。
+- banner 对照实验（`evidence/banner_gate_evidence.md`）。
+- 社区项目本机运行日志（`evidence/glmproxy_run2.log`）：`→ upstream model=zai_auto`、`← upstream status=200`，并返回真实补全（**非流式已实测；流式未取得实证**）。
+
+---
+
+## 6. 风险、合规与边界
+
+| 风险 | 概率 | 影响 | 缓解 |
+|---|---|---|---|
+| 上游契约变更（banner/头/模型名）致 400 | 中 | 反代失效 | 按 §8 再对齐；banner 文案可用环境变量热覆盖 |
+| 风控/封禁（非官方客户端用法） | 中低 | 账号受限 | 仅自用、低频、不与官方客户端抢并发；不要对外分发或转售 |
+| 服务条款冲突 | 中 | 账号/法律责任 | 使用前自行确认 AutoClaw 用户协议；本报告仅做技术可行性分析 |
+| token 过期（桌面端退出登录） | 高（必然） | 401 | 反代对 401 返回可操作提示；重新登录桌面端即可 |
+| 本地端点滥用（CSRF） | 中 | 默认无鉴权时，任意本机浏览器页面可跨站 POST 到反代端点并消耗积分 | 常驻时设 `PROXY_API_KEY`，限制为可信本机工具 |
+| 并发限流 | 中 | 403/400 | 实测 4 路并发曾触发 403；建议串行或低并发 |
+| 本地端口暴露 | 低 | 凭证被滥用 | 默认只绑 `127.0.0.1`；需要时加 `PROXY_API_KEY`；勿映射公网 |
+| 凭证明文读取 | 低 | 本机越权读取 | 反代只读不写、不额外复制；但 `openclaw.json` / `request-headers.json` 本就存明文 JWT（受保护控制面文件） |
+| 模型清单漂移 / 未复刻官方头 | 低 | 清单不一致或上游收紧风控 | 以 `/healthz` 注册表为准；官方额外头（X-Agent-Team 等）当前非必需，如上游收紧需补齐 |
+
+---
+
+## 7. 使用与集成
+
+### 7.1 启动反代
+
+```bash
+cd autoclaw-credit-proxy
+python3 proxy.py                                  # http://127.0.0.1:8787
+PROXY_API_KEY=sk-local python3 proxy.py           # 带本地鉴权
+```
+
+### 7.2 接 OpenAI 生态
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="unused")
+client.chat.completions.create(model="zai_auto", messages=[{"role":"user","content":"你好"}])
+```
+
+Cline / Continue / Roo Code 等工具：Provider 选 OpenAI Compatible，Base URL `http://127.0.0.1:8787/v1`，模型填 `zai_auto`（或别名 `gpt-4o`）。
+
+Claude Code 等 Anthropic 协议客户端：本反代只提供 OpenAI 格式；可改用社区项目 glmproxy 的 Anthropic 端点（`http://127.0.0.1:18792`），或在反代前面再挂一个 OpenAI→Anthropic 翻译层。
+
+### 7.3 路线 C：CLIProxyAPI 配置片段
+
+```yaml
+openai-compatibility:
+  - name: autoclaw
+    base-url: "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw"
+    api-key-entries:
+      - api-key: "placeholder"   # 需要薄壳注入真实 JWT（见下）
+    headers:
+      X-Authorization: "$x-auth"   # 值以 $ 开头 = 从下游请求头复制
+      X-Request-Model: "zai_auto"
+      X-Tm: "mac"
+      X-Version: "1.18.1"
+      X-Product: "autoclaw"
+      X-Channel: "zai"
+      X-Lang: "zh-CN"
+      X-Client-Type: "pc"
+    models:
+      - name: "zai_auto"
+        alias: "zai_auto"
+```
+
+两点必须注意：
+
+1. `headers` 是静态 map，不读 `request-headers.json`、不自动刷新 JWT。做法是让上游薄壳（如本报告的 `proxy.py`）在转发时把新鲜 JWT 放进下游请求头 `x-auth`，由 `$x-auth` 动态复制。
+2. CLIProxyAPI 不改请求体，因此 **banner 必须在薄壳或调用方注入**——这正是路线 A 反代负责的事。
+
+### 7.4 路线 D：开启网关自带 OpenAI 端点
+
+在 OpenClaw 配置（`~/.openclaw-autoclaw/openclaw.json`，属受保护控制面文件，改前建议备份/走桌面端流程）中设置：
+
+```json5
+{ "gateway": { "http": { "endpoints": { "chatCompletions": { "enabled": true } } } } }
+```
+
+然后即可用网关 operator token 调用：
+
+```bash
+curl -sS http://127.0.0.1:18789/v1/models -H "Authorization: Bearer $OPENCLAW_GATEWAY_TOKEN"
+curl -sS http://127.0.0.1:18789/v1/chat/completions \
+  -H "Authorization: Bearer $OPENCLAW_GATEWAY_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"openclaw/default","messages":[{"role":"user","content":"hi"}]}'
+```
+
+注意：该端点语义是「agent 目标」（`openclaw/default`、`openclaw/<agentId>`），走完整 agent 运行时；裸模型覆盖用 `x-openclaw-model: zai/zai_auto`（需要 operator.admin 权限）。
+
+---
+
+## 8. 维护与再对齐指南
+
+上游契约变化时的排查顺序：
+
+1. `GET /healthz` 看 token 是否存在、`token_exp_unix` 是否过期 → 过期则重新登录桌面端。
+2. 看反代日志的 `upstream=` 状态码：401 = 凭证问题；400 `invalid request` = 契约问题。
+3. 契约问题按序检查：system banner 文案（`PROXY_SYSTEM_BANNER` 覆盖）→ `X-Request-Model`/body 模型名映射 → 上游 baseUrl 路径。
+4. 对照三处现成参照物：`~/.openclaw-autoclaw/logs/gateway.log` 的 `[AutoClawRequestTrace]` 行（网关真实请求的标记）、`~/.openclaw-autoclaw/openclaw.runtime.json`（模型目录）、社区项目 glmproxy 的 `lib/core.js`（头与 banner 的最新写法）。
+
+---
+
+## 9. 附录
+
+### 9.1 本机环境事实
+
+- macOS 25.6.0 (arm64)，Python 3.14.7，Node v26.8.2
+- AutoClaw 1.18.1；网关端口 18789；桌面端本地服务 127.0.0.1:19681
+- 模型清单（本机 6 个）：`zai_auto`、`zai_auto-fast`、`zaicoding_glm-5.3`、`zai_glm-5.3-flash`、`tdpsk_deepseek-v4-flash-202605`、`tdpsk_deepseek-v4-pro-202606`
+- 注：`openclaw.runtime.json` 中还出现 `zai_glm-5-turbo` 等条目，但该 id 上游判为非法模型（不可用）；反代以 `openclaw.json` 为准，模型变化无需改代码
+
+### 9.2 证据文件
+
+| 文件 | 内容 |
+|---|---|
+| `evidence/banner_gate_evidence.md` | banner 对照实验（400 vs 200）与响应样例 |
+| `evidence/independent_review.md` | 独立复核报告：三道门禁对照实验表、模型清单核对、代码边界与过度声明清单 |
+| `evidence/smoke_v2.log` | 自研反代冒烟 4/4 完整输出 |
+| `evidence/gateway_200_traces.txt` | 网关成功请求 trace（`status=200`） |
+| `evidence/glmproxy_run.log` / `glmproxy_run2.log` | 社区项目本机运行日志 |
+
+### 9.3 参考来源
+
+- CLIProxyAPI：<https://github.com/router-for-me/CLIProxyAPI>
+- GLM_proxy（同类项目，本机实测参照）：<https://github.com/eequaled/GLM_proxy>
+- OpenClaw 网关 OpenAI HTTP 端点文档（本机文档库）：`docs/gateway/openai-http-api.md`
+- AutoClaw 云端 API 面（本机日志观察所得）：`/userapi/v1/*`、`/agentdr/v1/assistant/*`、`/agent-assetmgr/api/v1/*`（积分钱包）
+
+### 9.4 方法与局限
+
+- 方法：本机运行时产物静态分析 + 网络探针矩阵 + 对照实验 + 第三方开源实现交叉验证 + 端到端冒烟。
+- 局限：所有结论基于 2026-09-14 的 AutoClaw 1.18.1 与当时的上游行为；未做长时段稳定性与并发压测；未验证多账号、图片输入、工具调用的完整链路；TLS/JA3 指纹、频率策略、`max_tokens` 超限计费**未独立复现**；官方客户端携带的 `X-Agent-Team` / `X-Agent-Mode` / `X-Session-Key` 等头未复刻（当前非必需）；路线 C 的配置片段来自源码阅读，未端到端跑通 CLIProxyAPI 本体；社区项目 glmproxy 仅非流式在本机取得成功实证。
