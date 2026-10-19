@@ -39,16 +39,24 @@ curl http://127.0.0.1:8378/v1/chat/completions -H "Content-Type: application/jso
 
 # Anthropic Messages
 curl http://127.0.0.1:8378/v1/messages -H "Content-Type: application/json" -d '{
-  "model": "claude-sonnet-5", "max_tokens": 4096,
+  "model": "zai_auto", "max_tokens": 4096,
   "messages": [{"role":"user","content":"你好"}]
 }'
 
 # OpenAI Responses
 curl http://127.0.0.1:8378/v1/responses -H "Content-Type: application/json" -d '{
-  "model": "gpt-5", "max_output_tokens": 2048,
+  "model": "zai_auto", "max_output_tokens": 2048,
   "input": "你好"
 }'
 ```
+
+**`model` 填什么都行。** 上游真实 id（`GET /v1/models` 查看目录）直接命中；
+填 `claude-sonnet-5` / `gpt-5` 这类客户端固化的名字，或者干脆拼错了，都会落到
+`zai_auto`——那是上游的自动路由档，也正是"我要个通用模型"这个意图的正确答案。
+
+想让某个名字固定到特定档位（比如把 `my-fast` 钉在 flash 上），用
+`AUTOCLAW_MODEL_ALIASES` 显式声明。日志会记录每次未命中的路由结果，
+`zai-glm-5.3-flash` 这类只差分隔符的笔误还会额外提示一次疑似对象。
 
 ---
 
@@ -74,9 +82,9 @@ AutoClaw 2.x 上游有三条实测门禁，违反即失败，**且都在请求�
 `max_tokens`、Responses 的 `max_output_tokens` 都是必填字段，在 `adapters/` 出口
 和 `lanes/` 各删一次，双保险。
 
-模型名也是同理：客户端填 `claude-sonnet-5` / `gpt-5` / `deepseek-v3` 这类名字，
-`resolve_model()` 会按「上游目录 → 显式别名 → 家族前缀」解析成真实 id，
-解析不到只警告不拒绝（上游裁决，避免本地黑名单挡住新模型）。
+模型名同理：`_open_upstream()` 的 `resolve_model()` 把它换成上游 id，
+因为路由读的是 `X-Request-Model` 而不是 `body.model`。未知名落到默认档，
+不报错——`zai_auto` 就是上游的自动路由档。
 
 ---
 
@@ -145,7 +153,7 @@ header（那里有明文 JWT）。
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `406` 空响应 | 三条硬约束之一被触发 | 看 `dumps/` 里的 `*.resp.txt`；通常是 `max_tokens` 又回来了 |
-| `400` `非法模型` | 模型名没解析成上游 id | `GET /v1/models` 看目录；用 `AUTOCLAW_MODEL_ALIASES` 显式映射 |
+| `400` `非法模型` | 上游拒绝该 id | 看 `request.log` 里的路由记录；通常是目录刚刷新、拼写偏差 |
 | `401` | token 过期或桌面端已退出登录 | 重新登录桌面端；本服务会自动重新解密重试一次 |
 | `403` `pay-view` (`code=810001`) | **账号配额状态**，与请求内容无关，分钟级波动 | 本服务透传且不重试；等待或充值，不是反代的问题 |
 | `SSLError: UNEXPECTED_EOF_WHILE_READING` | 该 host 间歇性 TLS 断连 | `_open_upstream()` 已带退避重试（2s/4s/8s，共 4 次） |

@@ -90,13 +90,19 @@ _probe_cache = {"done": 0, "total": 0, "unavailable": 0, "at": "", "results": []
 
 
 # ── 模型名解析 ────────────────────────────────────────────────────────
-# 客户端填的模型名（claude-sonnet-5 / gpt-5 / deepseek-v3…）不是上游模型 id，
-# 上游一见就 400 非法模型。三类来源按优先级解析，命中即用上游真实 id：
-#   1. 直接命中上游目录（zai_auto / zai_auto-fast / zaicoding_glm-5.3 …）
-#   2. AUTOCLAW_MODEL_ALIASES 环境变量里的显式映射（JSON）
-#   3.  DEFAULT_MODEL（zai_auto）
-# 查不到的模型名只警告不拒绝——上游的模型目录可能滞后于服务端，
-# 直接放行由上游裁决，比本地黑名单把新模型挡在外面好。
+# 路由读的是 X-Request-Model，必须是上游真实 id（zai_auto / zai_auto-fast /
+# zaicoding_glm-5.3 / zai_glm-5.3-flash）。三种来源按优先级：
+#   1. 直接命中上游目录
+#   2. AUTOCLAW_MODEL_ALIASES 显式映射（JSON）——想固定用某个档位时才需要
+#   3. DEFAULT_MODEL（zai_auto，上游的自动路由档）
+#
+# 为什么未知名落到默认档而不是报错：客户端填的 model 大多只是表达意图
+# （"我要个通用模型"），而 zai_auto 恰好就是上游的自动路由档，正是这个意图
+# 的正确答案。为「claude-sonnet-5 该对应哪个 GLM 档位」让每个客户端配一遍
+# alias，成本远高于收益。拼错同理——拿到的是自动档，照样能答，日志里记着。
+#
+# 唯一例外是近似名：拼 zai-glm 而目录里有 zai_glm 时，会在日志里提示一次，
+# 因为那八成是笔误而非意图，但不改变行为（排障时看日志能发现）。
 _ALIAS_ENV = os.getenv("AUTOCLAW_MODEL_ALIASES", "")
 try:
     MODEL_ALIASES = json.loads(_ALIAS_ENV) if _ALIAS_ENV.strip() else {}
@@ -107,8 +113,20 @@ except ValueError:
     logger.warning("AUTOCLAW_MODEL_ALIASES 不是合法 JSON，已忽略")
 
 
+def _near_miss(name: str, available: list):
+    """名字和某个真实 id 只差分隔符/大小写时返回它，否则 None。
+
+    只用来打日志提示「你可能想用的是这个」，不改变路由结果。
+    """
+    key = name.lower().replace("-", "").replace("_", "").replace(".", "")
+    for mid in available:
+        if mid.lower().replace("-", "").replace("_", "").replace(".", "") == key:
+            return mid
+    return None
+
+
 def resolve_model(name: str) -> str:
-    """客户端模型名 → 上游模型 id。"""
+    """客户端模型名 → 上游模型 id。解析不到落到 ``DEFAULT_MODEL``。"""
     name = (name or "").strip()
     if not name:
         return DEFAULT_MODEL
@@ -116,13 +134,12 @@ def resolve_model(name: str) -> str:
         return name
     if name in MODEL_ALIASES:
         return MODEL_ALIASES[name]
-    # 家族前缀匹配：claude-* → zai_auto、deepseek-* → zai_glm-5.3-flash
-    low = name.lower()
-    for prefix, target in (("claude", "zai_auto"), ("deepseek", "zai_glm-5.3-flash"),
-                           ("glm", "zai_glm-5.3-flash")):
-        if low.startswith(prefix):
-            return target
-    logger.warning("模型名 %r 不在上游目录，按 %r 路由", name, DEFAULT_MODEL)
+    near = _near_miss(name, _list_models())
+    if near:
+        logger.warning("模型名 %r 不在目录中，疑似 %r 的笔误；本次按 %r 路由",
+                       name, near, DEFAULT_MODEL)
+    else:
+        logger.warning("模型名 %r 不在目录中，按 %r 路由", name, DEFAULT_MODEL)
     return DEFAULT_MODEL
 
 
@@ -328,6 +345,13 @@ def _upstream_error(resp) -> tuple:
 
 
 # ── 模型目录 ────────────────────────────────────────────────────────
+# 目录拉取失败时的兜底清单。**必须是已知模型的全集而不是常用子集**：反代对
+# 未知名模型是报错而非兜底，兜底清单漏了谁，目录拉失败时谁就会被误判成
+# 「不存在」。本机 2026-10-19 实测目录为这 4 个；上游新增模型后这里不会自动
+# 跟上，但拉取成功时以目录为准，所以漏加只影响「目录拉失败」这一小段时间。
+_FALLBACK_MODELS = ["zai_auto", "zai_auto-fast", "zaicoding_glm-5.3", "zai_glm-5.3-flash"]
+
+
 def _list_models() -> list:
     now = time.time()
     with _models_lock:
@@ -380,8 +404,8 @@ def _open_upstream(payload: dict):
     ``payload`` 是**已翻译成 Chat 的请求体**（OpenAI 客户端原样、Anthropic/
     Responses 经 adapters/ 转过），406 三条硬约束在 lanes.build_request 里落实。
 
-    模型名在这里解析成上游 id：客户端填的 ``claude-sonnet-5`` 之类上游不认，
-    直接发会拿到 400 非法模型（路由读的是 X-Request-Model，不是 body.model）。
+    模型名在这里解析成上游 id（路由读的是 X-Request-Model，不是 body.model）。
+    解析不了抛 ``ModelNotFound``——路由层负责翻成各自协议的错误格式。
     """
     token = _token()
     requested = (payload.get("model") or "").strip()
@@ -658,8 +682,12 @@ def admin_self_check():
     if denied:
         return denied
 
+    # 用上游目录里第一个真实模型名做样本：自检要验证的是「整形逻辑能否把脏
+    # 请求洗干净」，不是某个特定名字能否解析（那是 resolve_model 的职责）。
+    available = _list_models()
+    sample = available[0] if available else DEFAULT_MODEL
     dirty = {
-        "model": "claude-sonnet-5",
+        "model": sample,
         "max_tokens": 4096,
         "max_completion_tokens": 2048,
         "max_output_tokens": 1024,
@@ -672,13 +700,6 @@ def admin_self_check():
     }
     headers, body, meta = autoclaw.build_request(
         dirty, "TOKEN", AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
-    model = resolve_model(dirty["model"])
-    available = _list_models()
-    # 真实请求路径是 _open_upstream 先 resolve_model 再 build_request，
-    # 自检要照这个顺序来，否则 detail 里显示的是未解析的客户端模型名
-    if model != dirty["model"]:
-        headers, body, meta = autoclaw.build_request(
-            {**dirty, "model": model}, "TOKEN", AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
 
     checks = [
         {
@@ -709,8 +730,21 @@ def admin_self_check():
         {
             "id": "model_in_catalog",
             "label": "③ 模型在上游目录内",
-            "ok": model in available,
-            "detail": "%s → %s" % (dirty["model"], model),
+            "ok": headers.get("X-Request-Model") in available,
+            "detail": "%s ∈ {%s}" % (headers.get("X-Request-Model"),
+                                     ", ".join(available) or "?"),
+        },
+        {
+            "id": "unknown_model_defaults",
+            "label": "未知名模型落到默认档（不报错）",
+            "ok": resolve_model("__autoclaw_selfcheck_nonexistent__") == DEFAULT_MODEL,
+            "detail": "未知名 → %s" % DEFAULT_MODEL,
+        },
+        {
+            "id": "near_miss_hint",
+            "label": "近似笔误能被识别（仅提示）",
+            "ok": _near_miss("zai-glm-5.3-flash", available) is not None,
+            "detail": "zai-glm-5.3-flash → %s" % (_near_miss("zai-glm-5.3-flash", available) or "?"),
         },
         {
             "id": "no_harness_type",
@@ -748,8 +782,8 @@ def admin_probe_models():
     if denied:
         return denied
 
-    models = request.get_json(silent=True) and request.get_json(silent=True).get("models")
-    models = models or _list_models()
+    requested = request.get_json(silent=True) and request.get_json(silent=True).get("models")
+    models = requested or _list_models()
     token = _token()
     results = []
     for mid in models:
