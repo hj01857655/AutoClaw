@@ -1,11 +1,16 @@
 # AutoClaw2api
 
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Flask](https://img.shields.io/badge/Flask-3.x-black.svg)](https://flask.palletsprojects.com/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)](#快速开始)
+[![Protocols](https://img.shields.io/badge/protocols-Chat%20%7C%20Anthropic%20%7C%20Responses-teal.svg)](#快速开始)
+
 AutoClaw（澳龙）桌面端托管模型的本地 **OpenAI / Anthropic / Responses** 三协议网关。
 
 把 AutoClaw 桌面客户端消费的云端模型包装成标准协议，任何支持自定义 Base URL 的客户端
 指向本服务即可调用，无需改客户端代码。
 
-分析依据见 `../docs/autoclaw-10-2x门禁与反代落地.md`。
+分析依据见 [`docs/autoclaw-10-2x门禁与反代落地.md`](docs/autoclaw-10-2x门禁与反代落地.md)。
 
 ---
 
@@ -91,11 +96,13 @@ AutoClaw 2.x 上游有三条实测门禁，违反即失败，**且都在请求�
 ## 目录结构
 
 ```
-server.py            调度层：装配 Flask、鉴权、上游重试、日志/落盘、SSE 产出
-lanes/autoclaw.py    通道层：凭据解密、请求整形（三条硬约束在此）、SSE 解析
-routes/              协议路由：chat.py / anthropic.py / responses.py
-adapters/            协议翻译：anthropic.py / responses.py ⇄ Chat
-panel.html           管理面板（门禁自检 / 可调性探测）
+AutoClaw2api/
+├── server.py            调度层：装配 Flask、鉴权、上游重试、日志/落盘、SSE 产出
+├── lanes/autoclaw.py    通道层：凭据解密、请求整形（三条硬约束在此）、SSE 解析
+├── routes/              协议路由：chat.py / anthropic.py / responses.py
+├── adapters/            协议翻译：anthropic.py / responses.py ⇄ Chat
+├── panel.html           管理面板（门禁自检 / 可调性探测）
+└── regress.py           三协议 × {真实id / 空名 / 未知名} 回归脚本
 ```
 
 分层原则：**routes/ 只管协议形状，lanes/ 只管怎么跟上游说话，server/ 只管调度**。
@@ -132,7 +139,7 @@ panel.html           管理面板（门禁自检 / 可调性探测）
 
 ## 环境变量
 
-复制 `.env.example` 为 `.env` 修改。常用项：
+复制 `AutoClaw2api/.env.example` 为 `AutoClaw2api/.env` 修改。常用项：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -164,8 +171,9 @@ header（那里有明文 JWT）。
 
 ## 与其余六个 2api 的关系
 
-同目录下的 WorkBuddy2api 等六个服务用同一套 `routes/` + `lanes/` + `adapters/`
-分层与 `register(app, core)` 挂载约定，端口 8378 避开其余六个（8389/8787/8381/8390/8788/8377）。
+`E:\VSCodeSpace\Agent\` 下的 WorkBuddy2api 等六个服务用同一套 `routes/` + `lanes/` +
+`adapters/` 分层与 `register(app, core)` 挂载约定，端口 8378 避开其余六个
+（8389/8787/8381/8390/8788/8377）。
 
 差别只在凭据来源：其余几家靠 OAuth / 密码换 token，AutoClaw 是 Chromium
 os_crypt 密文（DPAPI 护主密钥 + AES-256-GCM 护业务文件），只读不写。
