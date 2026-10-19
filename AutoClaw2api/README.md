@@ -50,13 +50,13 @@ curl http://127.0.0.1:8378/v1/responses -H "Content-Type: application/json" -d '
 }'
 ```
 
-**`model` 填什么都行。** 上游真实 id（`GET /v1/models` 查看目录）直接命中；
-填 `claude-sonnet-5` / `gpt-5` 这类客户端固化的名字，或者干脆拼错了，都会落到
-`zai_auto`——那是上游的自动路由档，也正是"我要个通用模型"这个意图的正确答案。
+**`model` 填 `/v1/models` 里的 id，反代原样透传、不做任何改写。** 客户端本来就
+都是从那里拉的，所以不需要解析也不需要映射。上游是唯一裁决者：它认得就 200，
+不认得就 `400 非法模型`——那个来自上游的错误比本地猜"你大概想要哪个档"更有用。
 
-想让某个名字固定到特定档位（比如把 `my-fast` 钉在 flash 上），用
-`AUTOCLAW_MODEL_ALIASES` 显式声明。日志会记录每次未命中的路由结果，
-`zai-glm-5.3-flash` 这类只差分隔符的笔误还会额外提示一次疑似对象。
+唯一一条兜底在 `lanes/autoclaw.py` 的 `build_request()`：`model` 留空时补
+`AUTOCLAW_DEFAULT_MODEL`，因为上游的 `X-Request-Model` 必填，而 OpenAI 协议里
+`model` 是可选的。
 
 ---
 
@@ -74,7 +74,8 @@ AutoClaw 2.x 上游有三条实测门禁，违反即失败，**且都在请求�
 这三条在本服务里的落实位置：
 
 - ①② → `lanes/autoclaw.py` 的 `sanitize_body()` + `ensure_banner()`，所有协议共用
-- ③ → `_open_upstream()` 的 `resolve_model()` + `build_request()`
+- ③ → `lanes/autoclaw.py` 的 `build_request()`（`body.model` → `X-Request-Model`，
+  留空补 `AUTOCLAW_DEFAULT_MODEL`）
 - 额外：`system` 里的外来 harness 身份句（`you are claude code` 等）会被中和，
   否则上游同样回 406
 
@@ -82,9 +83,8 @@ AutoClaw 2.x 上游有三条实测门禁，违反即失败，**且都在请求�
 `max_tokens`、Responses 的 `max_output_tokens` 都是必填字段，在 `adapters/` 出口
 和 `lanes/` 各删一次，双保险。
 
-模型名同理：`_open_upstream()` 的 `resolve_model()` 把它换成上游 id，
-因为路由读的是 `X-Request-Model` 而不是 `body.model`。未知名落到默认档，
-不报错——`zai_auto` 就是上游的自动路由档。
+模型名同理：反代不碰它，`build_request()` 直接拿 `body.model` 填 `X-Request-Model`。
+只有留空时才补默认档。
 
 ---
 
@@ -140,7 +140,7 @@ panel.html           管理面板（门禁自检 / 可调性探测）
 | `API_KEY` | 空 | 本地 API Key。留空 = 不校验（配合回环监听即「本机随便调」） |
 | `AUTOCLAW_BASE` | `%APPDATA%/AutoClaw-official` | 用户数据根 |
 | `AUTOCLAW_ACCOUNT` | 自动 | 多账号时指定账号目录 |
-| `AUTOCLAW_MODEL_ALIASES` | 空 | 模型名映射（JSON） |
+| `AUTOCLAW_DEFAULT_MODEL` | `zai_auto` | 客户端没填 `model` 时补的档位 |
 | `DUMP` | `1` | 是否落盘请求/响应原文到 `dumps/` |
 
 **凭据不落在任何配置文件里**——一律从桌面端密文现场解密，`dumps/` 也绝不记录
@@ -153,7 +153,7 @@ header（那里有明文 JWT）。
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `406` 空响应 | 三条硬约束之一被触发 | 看 `dumps/` 里的 `*.resp.txt`；通常是 `max_tokens` 又回来了 |
-| `400` `非法模型` | 上游拒绝该 id | 看 `request.log` 里的路由记录；通常是目录刚刷新、拼写偏差 |
+| `400` `非法模型` | 上游不认这个 id | 从 `GET /v1/models` 里挑；该错误来自上游，反代不改写模型名 |
 | `401` | token 过期或桌面端已退出登录 | 重新登录桌面端；本服务会自动重新解密重试一次 |
 | `403` `pay-view` (`code=810001`) | **账号配额状态**，与请求内容无关，分钟级波动 | 本服务透传且不重试；等待或充值，不是反代的问题 |
 | `SSLError: UNEXPECTED_EOF_WHILE_READING` | 该 host 间歇性 TLS 断连 | `_open_upstream()` 已带退避重试（2s/4s/8s，共 4 次） |

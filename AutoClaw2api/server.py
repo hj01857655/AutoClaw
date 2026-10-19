@@ -89,58 +89,14 @@ _probe_lock = threading.Lock()
 _probe_cache = {"done": 0, "total": 0, "unavailable": 0, "at": "", "results": []}
 
 
-# ── 模型名解析 ────────────────────────────────────────────────────────
-# 路由读的是 X-Request-Model，必须是上游真实 id（zai_auto / zai_auto-fast /
-# zaicoding_glm-5.3 / zai_glm-5.3-flash）。三种来源按优先级：
-#   1. 直接命中上游目录
-#   2. AUTOCLAW_MODEL_ALIASES 显式映射（JSON）——想固定用某个档位时才需要
-#   3. DEFAULT_MODEL（zai_auto，上游的自动路由档）
+# ── 模型名 ────────────────────────────────────────────────────────────
+# 客户端从 /v1/models 拉目录，只会填目录里的 id（zai_auto / zai_auto-fast /
+# zaicoding_glm-5.3 / zai_glm-5.3-flash），不会自己造名字——所以反代**原样透传**，
+# 不解析、不映射、不兜底。上游是唯一的裁决者：它认得就 200，不认得就
+# 400 非法模型，那个错误比本地猜一个"你大概想要哪个档"更有用。
 #
-# 为什么未知名落到默认档而不是报错：客户端填的 model 大多只是表达意图
-# （"我要个通用模型"），而 zai_auto 恰好就是上游的自动路由档，正是这个意图
-# 的正确答案。为「claude-sonnet-5 该对应哪个 GLM 档位」让每个客户端配一遍
-# alias，成本远高于收益。拼错同理——拿到的是自动档，照样能答，日志里记着。
-#
-# 唯一例外是近似名：拼 zai-glm 而目录里有 zai_glm 时，会在日志里提示一次，
-# 因为那八成是笔误而非意图，但不改变行为（排障时看日志能发现）。
-_ALIAS_ENV = os.getenv("AUTOCLAW_MODEL_ALIASES", "")
-try:
-    MODEL_ALIASES = json.loads(_ALIAS_ENV) if _ALIAS_ENV.strip() else {}
-    if not isinstance(MODEL_ALIASES, dict):
-        MODEL_ALIASES = {}
-except ValueError:
-    MODEL_ALIASES = {}
-    logger.warning("AUTOCLAW_MODEL_ALIASES 不是合法 JSON，已忽略")
-
-
-def _near_miss(name: str, available: list):
-    """名字和某个真实 id 只差分隔符/大小写时返回它，否则 None。
-
-    只用来打日志提示「你可能想用的是这个」，不改变路由结果。
-    """
-    key = name.lower().replace("-", "").replace("_", "").replace(".", "")
-    for mid in available:
-        if mid.lower().replace("-", "").replace("_", "").replace(".", "") == key:
-            return mid
-    return None
-
-
-def resolve_model(name: str) -> str:
-    """客户端模型名 → 上游模型 id。解析不到落到 ``DEFAULT_MODEL``。"""
-    name = (name or "").strip()
-    if not name:
-        return DEFAULT_MODEL
-    if name in _list_models():
-        return name
-    if name in MODEL_ALIASES:
-        return MODEL_ALIASES[name]
-    near = _near_miss(name, _list_models())
-    if near:
-        logger.warning("模型名 %r 不在目录中，疑似 %r 的笔误；本次按 %r 路由",
-                       name, near, DEFAULT_MODEL)
-    else:
-        logger.warning("模型名 %r 不在目录中，按 %r 路由", name, DEFAULT_MODEL)
-    return DEFAULT_MODEL
+# 连「空名补默认」都不在这里做：lanes.build_request() 的
+# ``payload.get("model") or "zai_auto"`` 已经兜了，再来一层是重复。
 
 
 # ── 本地鉴权与 CORS ───────────────────────────────────────────────────
@@ -345,10 +301,8 @@ def _upstream_error(resp) -> tuple:
 
 
 # ── 模型目录 ────────────────────────────────────────────────────────
-# 目录拉取失败时的兜底清单。**必须是已知模型的全集而不是常用子集**：反代对
-# 未知名模型是报错而非兜底，兜底清单漏了谁，目录拉失败时谁就会被误判成
-# 「不存在」。本机 2026-10-19 实测目录为这 4 个；上游新增模型后这里不会自动
-# 跟上，但拉取成功时以目录为准，所以漏加只影响「目录拉失败」这一小段时间。
+# 目录拉取失败时的兜底清单，只影响 /v1/models 的显示内容，**不参与路由裁决**
+# （模型名直接透传给上游）。本机 2026-10-19 实测目录为这 4 个。
 _FALLBACK_MODELS = ["zai_auto", "zai_auto-fast", "zaicoding_glm-5.3", "zai_glm-5.3-flash"]
 
 
@@ -404,16 +358,9 @@ def _open_upstream(payload: dict):
     ``payload`` 是**已翻译成 Chat 的请求体**（OpenAI 客户端原样、Anthropic/
     Responses 经 adapters/ 转过），406 三条硬约束在 lanes.build_request 里落实。
 
-    模型名在这里解析成上游 id（路由读的是 X-Request-Model，不是 body.model）。
-    解析不了抛 ``ModelNotFound``——路由层负责翻成各自协议的错误格式。
+    模型名原样透传；留空时 lanes.build_request() 补默认档。
     """
     token = _token()
-    requested = (payload.get("model") or "").strip()
-    model = resolve_model(requested)
-    if model != requested:
-        payload = {**payload, "model": model}
-        logger.info("[%s] 模型名 %r 解析为 %r",
-                    getattr(g, "rid", "?"), requested, model)
     for attempt in range(_UPSTREAM_MAX_ATTEMPTS):
         headers, body, meta = autoclaw.build_request(
             payload, token, AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
@@ -683,7 +630,7 @@ def admin_self_check():
         return denied
 
     # 用上游目录里第一个真实模型名做样本：自检要验证的是「整形逻辑能否把脏
-    # 请求洗干净」，不是某个特定名字能否解析（那是 resolve_model 的职责）。
+    # 请求洗干净」，不是某个特定名字能否解析（模型名本来就原样透传）。
     available = _list_models()
     sample = available[0] if available else DEFAULT_MODEL
     dirty = {
@@ -728,23 +675,11 @@ def admin_self_check():
             "detail": headers.get("X-Request-Model", "(缺失)"),
         },
         {
-            "id": "model_in_catalog",
-            "label": "③ 模型在上游目录内",
-            "ok": headers.get("X-Request-Model") in available,
-            "detail": "%s ∈ {%s}" % (headers.get("X-Request-Model"),
-                                     ", ".join(available) or "?"),
-        },
-        {
-            "id": "unknown_model_defaults",
-            "label": "未知名模型落到默认档（不报错）",
-            "ok": resolve_model("__autoclaw_selfcheck_nonexistent__") == DEFAULT_MODEL,
-            "detail": "未知名 → %s" % DEFAULT_MODEL,
-        },
-        {
-            "id": "near_miss_hint",
-            "label": "近似笔误能被识别（仅提示）",
-            "ok": _near_miss("zai-glm-5.3-flash", available) is not None,
-            "detail": "zai-glm-5.3-flash → %s" % (_near_miss("zai-glm-5.3-flash", available) or "?"),
+            "id": "model_passthrough",
+            "label": "③ 模型名原样透传（不本地改写）",
+            "ok": headers.get("X-Request-Model") == sample,
+            "detail": "body.model=%s → X-Request-Model=%s"
+                      % (sample, headers.get("X-Request-Model")),
         },
         {
             "id": "no_harness_type",
