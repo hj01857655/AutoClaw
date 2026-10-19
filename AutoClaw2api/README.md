@@ -87,7 +87,7 @@ server.py            调度层：装配 Flask、鉴权、上游重试、日志/�
 lanes/autoclaw.py    通道层：凭据解密、请求整形（三条硬约束在此）、SSE 解析
 routes/              协议路由：chat.py / anthropic.py / responses.py
 adapters/            协议翻译：anthropic.py / responses.py ⇄ Chat
-panel.html           管理面板（可选）
+panel.html           管理面板（门禁自检 / 可调性探测）
 ```
 
 分层原则：**routes/ 只管协议形状，lanes/ 只管怎么跟上游说话，server/ 只管调度**。
@@ -98,10 +98,24 @@ panel.html           管理面板（可选）
 
 ## 管理面板
 
-- `GET /health` — 凭据状态、token 剩余有效期、当前模型目录
-- `GET /admin` — 面板页面
-- `GET /admin/api/overview` — 凭据 + 模型 + 当前生效的三条约束
-- `POST /admin/api/refresh-token` — 强制重新解密凭据
+`http://127.0.0.1:8378/admin`
+
+- **门禁自检** —— 把一个「全字段污染的请求」喂给 `build_request`，断言出口满足
+  三条硬约束（无 token 上限字段、含 banner、身份句已中和、`X-Request-Model` 已填
+  且在目录内、未发 `X-Harness-Type`、sign 用非空 appKey）。**不出网**，随时可跑。
+  它证明的是「反代会怎么做」，不等于「上游会接受」。
+- **探测可调性** —— 逐模型发极小请求实测。`pay-view` 是账号配额的分钟级波动，
+  所以「目录里有」不等于「现在能调」，只有实调能区分。结果会缓存并进 overview。
+- **刷新状态 / 重新解密凭据** —— 后者仅在桌面端刚刷新登录态、而 mtime 检查
+  恰好漏掉时用；正常情况下凭据按 mtime 热重载，自动跟随。
+
+| 接口 | 用途 |
+|---|---|
+| `GET /health` | 凭据状态、token 剩余有效期、当前模型目录 |
+| `GET /admin/api/overview` | 凭据 + 模型 + probe 缓存 + 当前生效的约束 |
+| `POST /admin/api/self-check` | 门禁自检（不出网） |
+| `POST /admin/api/probe-models` | 逐模型实测可调性 |
+| `POST /admin/api/refresh-token` | 强制重新解密凭据 |
 
 正常情况下**不需要**手动刷新：凭据按 mtime 热重载，桌面端刷新登录态后本服务
 自动跟随（TTL 5 分钟 + mtime 检查，成本是一次 stat）。

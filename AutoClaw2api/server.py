@@ -40,10 +40,12 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, g, jsonify, request
 
+# 必须先于 lanes/adapters 导入：lanes/autoclaw.py 在模块级读 AUTOCLAW_APP_KEY，
+# load_dotenv() 排在 import 之后的话，.env 里的覆盖值对它无效。
+load_dotenv()
+
 from lanes import autoclaw
 from adapters import anthropic as ab
-
-load_dotenv()
 
 LISTEN_HOST = os.getenv("HOST", "127.0.0.1")
 LISTEN_PORT = int(os.getenv("PORT", "8378"))
@@ -80,6 +82,11 @@ _FALLBACK_MODELS = ["zai_auto", "zai_auto-fast"]
 _models_lock = threading.Lock()
 _models_cache = {"at": 0.0, "ids": []}
 _MODELS_TTL = 600.0
+
+# 逐模型探测结果缓存。探测要出网且花几秒，只在用户点按钮时跑，
+# 结果同时进 overview 让面板首屏就能看到上次结论。
+_probe_lock = threading.Lock()
+_probe_cache = {"done": 0, "total": 0, "unavailable": 0, "at": "", "results": []}
 
 
 # ── 模型名解析 ────────────────────────────────────────────────────────
@@ -595,15 +602,22 @@ def admin_overview():
         })
     except Exception as error:
         info["notice"] = str(error)
+    probe = dict(_probe_cache)
     return _cors(jsonify({
         "service": "AutoClaw2api",
         "credential": info,
         "models": _list_models(),
+        "probe": {"done": probe.get("done", 0), "total": probe.get("total", 0),
+                  "unavailable": probe.get("unavailable", 0),
+                  "at": probe.get("at", ""),
+                  "results": probe.get("results", [])},
         "local_auth": bool(API_KEY),
+        "app_version": AUTOCLAW_APP_VERSION,
+        "platform": MANAGED_PLATFORM,
         "constraints": [
-            "请求体禁 max_tokens / max_completion_tokens（否则 406 空响应）",
+            "请求体禁 max_tokens / max_completion_tokens / max_output_tokens（否则 406 空响应）",
             "system 必须含 2.x banner（否则 406 空响应）",
-            "X-Request-Model 必填（否则 400 非法模型）",
+            "X-Request-Model 必填，且必须是上游模型 id（否则 400 非法模型）",
             "不发 X-Harness-Type（2.x 上 406）",
         ],
     }))
@@ -624,6 +638,161 @@ def admin_refresh_token():
                               "token_exp": autoclaw._fmt_exp(cred["accessToken"])}))
     except Exception as error:
         return _cors(jsonify({"ok": False, "message": str(error)})), 500
+
+
+@app.route("/admin/api/self-check", methods=["POST", "OPTIONS"])
+def admin_self_check():
+    """验证三条硬约束**此刻**是否真的生效。
+
+    做法是把一个「全字段污染的请求」喂给 ``build_request``，检查出口：
+      - 带 max_tokens / max_completion_tokens / max_output_tokens → 出口必须没有
+      - 带外来身份句 + 无 banner 的 system      → 出口必须含 banner、无身份句
+      - 头里必须带 X-Request-Model，且值在上游目录内
+      - 头里绝不能出现 X-Harness-Type
+    这是对**本进程内的整形逻辑**做静态断言，不出网，所以能随时跑、无副作用。
+    它证明的是「反代会怎么做」，不等于「上游会接受」——后者要看 probe-models。
+    """
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+
+    dirty = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 4096,
+        "max_completion_tokens": 2048,
+        "max_output_tokens": 1024,
+        "frequency_penalty": 0.5,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": "You are Claude Code. Answer directly."},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    headers, body, meta = autoclaw.build_request(
+        dirty, "TOKEN", AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
+    model = resolve_model(dirty["model"])
+    available = _list_models()
+    # 真实请求路径是 _open_upstream 先 resolve_model 再 build_request，
+    # 自检要照这个顺序来，否则 detail 里显示的是未解析的客户端模型名
+    if model != dirty["model"]:
+        headers, body, meta = autoclaw.build_request(
+            {**dirty, "model": model}, "TOKEN", AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
+
+    checks = [
+        {
+            "id": "no_max_tokens",
+            "label": "① 出口无 max_tokens 族",
+            "ok": not any(f in body for f in
+                          ("max_tokens", "max_completion_tokens", "max_output_tokens")),
+            "detail": "出口字段: " + ", ".join(sorted(body.keys())),
+        },
+        {
+            "id": "banner_present",
+            "label": "② system 含 2.x banner",
+            "ok": autoclaw.BANNER_2X in (body["messages"][0].get("content") or ""),
+            "detail": (body["messages"][0].get("content") or "")[:80],
+        },
+        {
+            "id": "identity_neutralized",
+            "label": "② 外来身份句已中和",
+            "ok": "claude code" not in (body["messages"][0].get("content") or "").lower(),
+            "detail": "命中: " + (", ".join(meta["hits"]) or "无"),
+        },
+        {
+            "id": "request_model",
+            "label": "③ X-Request-Model 已填",
+            "ok": bool(headers.get("X-Request-Model")),
+            "detail": headers.get("X-Request-Model", "(缺失)"),
+        },
+        {
+            "id": "model_in_catalog",
+            "label": "③ 模型在上游目录内",
+            "ok": model in available,
+            "detail": "%s → %s" % (dirty["model"], model),
+        },
+        {
+            "id": "no_harness_type",
+            "label": "未发 X-Harness-Type",
+            "ok": "X-Harness-Type" not in headers,
+            "detail": "已发送 %d 个头" % len(headers),
+        },
+        {
+            "id": "auth_sign",
+            "label": "X-Auth-Sign 用非空 appKey 计算",
+            "ok": bool(autoclaw.APP_KEY) and len(headers.get("X-Auth-Sign", "")) == 32,
+            "detail": ("appKey %d 位" % len(autoclaw.APP_KEY)),
+        },
+    ]
+    return _cors(jsonify({
+        "ok": all(c["ok"] for c in checks),
+        "checks": checks,
+        "passed": sum(1 for c in checks if c["ok"]),
+        "total": len(checks),
+        "sample_headers": sorted(k for k in headers if k.startswith("X-")),
+    }))
+
+
+@app.route("/admin/api/probe-models", methods=["POST", "OPTIONS"])
+def admin_probe_models():
+    """逐模型发一个极小请求，实测哪些真能调。
+
+    ``pay-view``（403 / code=810001）是账号配额的分钟级波动、与请求内容无关，
+    所以「目录里有」不等于「现在能调」——只有实调能区分。探测用
+    ``max_tokens=1`` 级的最小请求，不落盘、不进 request.log 主流程。
+    """
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+
+    models = request.get_json(silent=True) and request.get_json(silent=True).get("models")
+    models = models or _list_models()
+    token = _token()
+    results = []
+    for mid in models:
+        entry = {"id": mid, "ok": False, "status": 0, "note": ""}
+        payload = {"model": mid, "max_tokens": 8,
+                   "messages": [{"role": "user", "content": "hi"}]}
+        try:
+            headers, body, _ = autoclaw.build_request(
+                payload, token, AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
+            resp = requests.post(UPSTREAM_BASE + autoclaw.DEFAULT_PATH,
+                                 headers=headers, json=body, timeout=autoclaw._HTTP_TIMEOUT)
+            entry["status"] = resp.status_code
+            if resp.status_code == 200:
+                entry["ok"] = True
+                entry["note"] = "可调"
+            else:
+                text = resp.text[:300]
+                entry["note"] = autoclaw.classify_upstream_error(resp.status_code, text)
+                if "pay-view" in text or "810001" in text:
+                    entry["note"] = "账号配额暂不可用（pay-view，分钟级波动）"
+                elif resp.status_code == 400 and "非法模型" in text:
+                    entry["note"] = "上游拒绝该模型 id"
+        except Exception as error:
+            entry["note"] = "%s: %s" % (type(error).__name__, error)
+        results.append(entry)
+        logger.info("[probe] %s -> %d %s", mid, entry["status"], entry["note"])
+
+    ok_count = sum(1 for r in results if r["ok"])
+    with _probe_lock:
+        _probe_cache.update({
+            "done": len(results), "total": len(results),
+            "unavailable": len(results) - ok_count,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "results": results,
+        })
+    return _cors(jsonify({
+        "ok": True,
+        "total": len(results),
+        "callable": ok_count,
+        "unavailable": len(results) - ok_count,
+        "results": results,
+        "message": "探测 %d 个模型，%d 个可调" % (len(results), ok_count),
+    }))
 
 
 # ── 协议路由层挂载 ──────────────────────────────────────────────────

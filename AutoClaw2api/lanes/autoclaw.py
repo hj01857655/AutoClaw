@@ -30,9 +30,15 @@ logger = logging.getLogger(__name__)
 
 # ── 上游契约常量（全部来自 main.cjs 实证，非猜测）─────────────────────
 APP_ID = "100003"
-# appKey 是 main.cjs 里明文硬编码的 32 位十六进制客户端标识，从安装包里提取后
-# 通过环境变量注入，不写死在源码里。提取方式见 docs/autoclaw-01 篇请求头一节。
-APP_KEY = os.environ.get("AUTOCLAW_APP_KEY", "")
+# appKey：main.cjs AUTOCLAW_COMPATIBLE_IDENTITY 里明文硬编码的 32 位十六进制
+# 客户端标识，只用于算 X-Auth-Sign = md5(appId & timestamp & appKey)。
+# 本机 2.1.0（mtime 2026-10-11）main.cjs:466500 实证该值未漂移。
+#
+# 默认值兜底、环境变量可覆盖：实测（probe7 F）证明 X-Auth-Sign 族不是门禁，
+# 三个头全删仍 200，所以缺了它不影响可用性。但既然要发就发对——空 key 会算出
+# 一个格式合法但值错误的 sign，比不发更容易误导排障，所以留默认值。
+_APP_KEY_DEFAULT = "38d2391985e2369a5fb8227d8e6cd5e5"
+APP_KEY = os.environ.get("AUTOCLAW_APP_KEY", "").strip() or _APP_KEY_DEFAULT
 DEFAULT_BASE = "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw"
 DEFAULT_PATH = "/chat/completions"
 DEFAULT_MODEL_CONFIG_PATH = "/autoclaw-proxy/proxy/autoclaw-model-config"
