@@ -1,4 +1,4 @@
-# AutoClaw2 逆向语料索引
+# AutoClaw2 技术语料索引
 
 - 目标：`%LOCALAPPDATA%\Programs\AutoClaw2`（Electron 桌面应用，未 asar 打包）
 - 开始时间：2026-09-29
