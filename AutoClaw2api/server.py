@@ -44,6 +44,7 @@ from flask import Flask, Response, g, jsonify, request
 # load_dotenv() 排在 import 之后的话，.env 里的覆盖值对它无效。
 load_dotenv()
 
+from lanes import account
 from lanes import autoclaw
 from lanes import oauth
 from adapters import anthropic as ab
@@ -58,6 +59,10 @@ AUTOCLAW_BASE = os.getenv("AUTOCLAW_BASE", "") or os.path.join(
 AUTOCLAW_ACCOUNT = os.getenv("AUTOCLAW_ACCOUNT", "") or None
 AUTOCLAW_APP_VERSION = os.getenv("AUTOCLAW_APP_VERSION", "2.1.0")
 UPSTREAM_BASE = os.getenv("AUTOCLAW_UPSTREAM_BASE", autoclaw.DEFAULT_BASE).rstrip("/")
+# 账号面 host：签到与余额在这里，与模型网关（UPSTREAM_BASE 带
+# /autoclaw-proxy/proxy/autoclaw 路径）不同——账号面只要域名。
+ACCOUNT_BASE = os.getenv("AUTOCLAW_ACCOUNT_BASE",
+                         "https://autoglm-acceleration-api.zhipuai.cn").rstrip("/")
 DEFAULT_MODEL = os.getenv("AUTOCLAW_DEFAULT_MODEL", "zai_auto")
 # 平台标识对应 main.cjs 的 managedPlatform()：win32->win, darwin->mac
 MANAGED_PLATFORM = os.getenv("AUTOCLAW_PLATFORM", "win" if os.name == "nt" else "mac")
@@ -132,8 +137,9 @@ def _guard():
 #
 #   desktop（默认）  解密桌面端的 DPAPI 密文。要同机、同 Windows 用户、装桌面端，
 #                    桌面端退出登录就断。
-#   oauth            自己走手机验证码登录，token 用 DPAPI 加密后存本地。
-#                    不依赖桌面端，与其余六个 2api 的凭据方式一致。
+#   oauth            自己走账号面的 OAuth（授权链接 + loopback 回调换 token），
+#                    token 用 DPAPI 加密后存本地。不依赖桌面端，
+#                    与其余六个 2api 的凭据方式一致。
 #
 # 选 oauth 时 desktop 那份仍然只读、不碰，两者可以并存——想切回去改环境变量即可。
 CRED_SOURCE = os.getenv("AUTOCLAW_CRED_SOURCE", "desktop").strip().lower()
@@ -145,6 +151,10 @@ _oauth_store = oauth.OAuthCredentialStore(
     _OAUTH_DIR, AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
     autoclaw.APP_ID, autoclaw.APP_KEY) if CRED_SOURCE == "oauth" else None
 
+# 进行中的 OAuth 授权流程。授权要在用户浏览器里完成，动辄几十秒，所以
+# begin() 只起流程存句柄就返回，由后台线程等回调，面板轮询 status。
+_oauth_flow = {}
+
 
 def _token() -> str:
     if _oauth_store is not None:
@@ -152,12 +162,29 @@ def _token() -> str:
     return _store.get()["accessToken"]
 
 
-def _mask_phone(phone: str) -> str:
-    """手机号打码后进日志。日志会被翻出来排障，别留完整号码。"""
-    phone = str(phone or "")
-    if len(phone) < 7:
-        return "***"
-    return phone[:3] + "****" + phone[-4:]
+def _oauth_wait_worker(flow):
+    """后台等授权回调，收尾写进 ``_oauth_flow``。
+
+    单独抽成函数而不是在 ``begin`` 里闭包，是为了让线程目标可被单测替换。
+    所有异常都在这里吃掉并落成 ``state: failed``——线程里抛出去的异常只会
+    进 logging 的默认 handler，面板什么都看不到，用户会对着一个永远转圈的
+    按钮发呆。
+    """
+    try:
+        cred = flow.wait()
+        _oauth_flow.update({"state": "ok", "cred": cred})
+        logger.info("OAuth 授权完成: account=%s exp=%s",
+                    str(cred.get("account") or "?")[:8] + "…",
+                    autoclaw._fmt_exp(cred["accessToken"]))
+    except oauth.AuthError as error:
+        _oauth_flow.update({"state": "failed", "error": str(error),
+                            "code": error.code})
+        logger.warning("OAuth 授权失败: %s (code=%s)", error, error.code)
+    except Exception as error:                      # noqa: BLE001
+        _oauth_flow.update({"state": "failed", "error": str(error)})
+        logger.exception("OAuth 授权出现意外失败")
+    finally:
+        flow.cancel()                               # 关掉 loopback，释放端口
 
 
 DUMP_DIR = os.environ.get("DUMP_DIR", "") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dumps")
@@ -579,6 +606,213 @@ def serve_panel():
         return Response(file.read(), content_type="text/html; charset=utf-8")
 
 
+# ── 账号积分（每日领取 + 余额查询）──────────────────────────────────
+_REFRESH_MARGIN_S = 30 * 60      # 剩不到 30 分钟就续
+_refresh_lock = threading.Lock()
+_refresh_state = {"at": 0.0, "error": ""}
+
+
+def _account_token():
+    """拿一个能打账号面的 token。desktop / oauth 两种来源都行。
+
+    desktop 来源下会在 token 临近过期时自动用 refreshToken 续期——
+    否则桌面端一旦退出登录，之前解出来的 accessToken 只能干等到失效。
+    OAuth 来源的续期由 ``OAuthCredentialStore.get()`` 自己负责。
+    """
+    if _oauth_store is not None:
+        return _oauth_store.get()
+    cred = _store.get()
+    token = cred["accessToken"]
+    expires_at = oauth.jwt_exp(token)
+    if not expires_at:
+        return token                     # 解不出 exp 就别猜，原样用
+    remain = expires_at - time.time()
+    if remain > _REFRESH_MARGIN_S:
+        return token
+    refresh_token = cred.get("refreshToken") or ""
+    if not refresh_token:
+        return token                     # 没有 refreshToken，续不了，原样用
+    # 加锁：面板同时刷好几个端点时会并发打到这儿，没必要重复换 token
+    with _refresh_lock:
+        # 双检：等锁的这段时间可能已经被别人续过了
+        cred = _store.get()
+        token = cred["accessToken"]
+        expires_at = oauth.jwt_exp(token)
+        if expires_at and expires_at - time.time() > _REFRESH_MARGIN_S:
+            return token
+        try:
+            fresh = oauth.refresh(
+                cred.get("refreshToken") or refresh_token,
+                oauth.load_or_create_device_id(_OAUTH_DIR),
+                AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
+                autoclaw.APP_ID, autoclaw.APP_KEY, cred.get("account") or "")
+        except Exception as error:
+            # 续期失败不致命：手上这个 token 可能还能用一会儿，照旧返回。
+            # 只记下来供 overview 提示，不往外抛。
+            _refresh_state["error"] = str(error)
+            _refresh_state["at"] = time.time()
+            logger.warning("token 续期失败（仍用旧的）: %s", error)
+            return token
+        # 把新 token 塞回 store 的缓存，否则 _store 的 TTL 缓存里还是旧的，
+        # 下一个并发请求双检时又读到旧的 → 白白再换一次（实测 8 并发换了 2 次）。
+        # 借 store 自己的锁改，避免和它的热重载打架。
+        merged = dict(cred)
+        merged.update({"accessToken": fresh["accessToken"],
+                       "refreshToken": fresh.get("refreshToken") or cred.get("refreshToken"),
+                       "expiresAt": fresh.get("expiresAt")})
+        with _store._lock:
+            _store._cred = merged
+            _store._at = time.time()
+        _refresh_state["error"] = ""
+        _refresh_state["at"] = time.time()
+        logger.info("token 已续期: %s → %s",
+                    autoclaw._fmt_exp(token), autoclaw._fmt_exp(fresh["accessToken"]))
+        return fresh["accessToken"]
+
+
+def _query_credits() -> dict:
+    """查积分余额，供 overview 带出去。
+
+    **失败时返回 available=False，不返回 0**：「余额查不到」和「余额是 0」
+    对用户是两件事，混成 0 会让人以为号废了（docs/autoclaw-02 的约定）。
+    """
+    try:
+        result = account.wallet_balance(ACCOUNT_BASE, _account_token(),
+                                        AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
+    except Exception as error:
+        return {"available": False, "error": str(error)}
+    payload = {"available": True, "total": result["total"],
+               "wallets": result["wallets"]}
+    # 过期积分：面板要在余额旁边标一句「3 天后有 N 分过期」，否则用户看到
+    # 余额掉下去只会以为号出问题了。
+    try:
+        expiring = account.points_expiring(ACCOUNT_BASE, _account_token(),
+                                           AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
+        if expiring.get("expiring"):
+            payload["expiring"] = expiring
+    except Exception as error:
+        logger.info("过期积分查询失败（不影响余额展示）: %s", error)
+    return payload
+
+
+@app.route("/admin/api/credits", methods=["GET", "OPTIONS"])
+def admin_credits():
+    """查积分余额（面板手动刷新用）。"""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    credits = _query_credits()
+    if not credits.get("available"):
+        return _cors(jsonify({"ok": False, "message": credits.get("error"),
+                              "credits": credits})), 502
+    return _cors(jsonify({"ok": True, "credits": credits}))
+
+
+@app.route("/admin/api/ledgers", methods=["GET", "OPTIONS"])
+def admin_ledgers():
+    """积分流水（分页）。``?page=1&page_size=20``。
+
+    每条带 ``actual_model`` / ``autoclaw_model_mode``，所以这个不只是账本——
+    它能回答「这次对话花了多少分、走的哪个模型」。
+    """
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    try:
+        page = int(request.args.get("page", "1"))
+        size = int(request.args.get("page_size", "20"))
+    except ValueError:
+        return _cors(jsonify({"ok": False, "message": "page / page_size 必须是数字"})), 400
+    page = max(1, page)
+    size = min(max(1, size), 100)
+    try:
+        entries = account.credit_ledgers(ACCOUNT_BASE, _account_token(),
+                                         AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
+                                         page, size)
+    except account.AccountError as error:
+        return _cors(jsonify({"ok": False, "message": str(error),
+                              "code": error.code})), 400
+    except Exception as error:
+        return _cors(jsonify({"ok": False, "message": str(error)})), 500
+    return _cors(jsonify({"ok": True, "page": page, "page_size": size,
+                          "entries": entries}))
+
+
+@app.route("/admin/api/claim", methods=["POST", "OPTIONS"])
+def admin_claim():
+    """领任意任务的积分。``{"task_id": "daily_signin"}``。
+
+    ``task_id`` 从 ``/admin/api/tasks`` 拿。服务端按天去重，重复点没有副作用。
+    ``task_id`` 缺失时退回每日签到——顶栏那个「领当日积分」按钮是快捷入口，
+    展开任务卡片太麻烦，所以留了这个默认值。
+    """
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    payload = request.get_json(silent=True) or {}
+    task_id = str(payload.get("task_id") or account.TASK_DAILY_SIGNIN).strip()
+    if not task_id or len(task_id) > 64 or not task_id.replace("_", "").replace("-", "").isalnum():
+        return _cors(jsonify({"ok": False, "message": "task_id 不合法"})), 400
+    try:
+        result = account.claim_task(
+            ACCOUNT_BASE, _account_token(), AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
+            task_id)
+    except account.AccountError as error:
+        return _cors(jsonify({"ok": False, "message": str(error),
+                              "code": error.code})), 400
+    except Exception as error:
+        return _cors(jsonify({"ok": False, "message": str(error)})), 500
+    if result["completed"]:
+        message = "已领 %d 积分" % result["points"]
+    elif result["already"]:
+        message = "今天已经领过了"
+    elif result["rejected"]:
+        # 这个任务不该在客户端领（invite_friends / upgrade_pc_app 都是这种）。
+        # 不是失败，别报红；上游给的话就带上它的原话。
+        message = result["message"] or "这个任务不支持在这里领取"
+    else:
+        message = "没领到，稍后再试"
+    return _cors(jsonify({
+        "ok": True,
+        "task_id": task_id,
+        "completed": result["completed"],
+        "already": result["already"],
+        "rejected": result["rejected"],
+        "points": result["points"],
+        "message": message,
+        "credits": _query_credits(),
+    }))
+
+
+@app.route("/admin/api/tasks", methods=["GET", "OPTIONS"])
+def admin_tasks():
+    """列任务（每日签到 / 灵感中心 / 邀请好友 / 升级客户端）。
+
+    每项带 ``claimable``（上游的 ``client_triggered``）——为 False 的任务
+    客户端点了也领不到，UI 应据此不渲染领取按钮。
+    """
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    try:
+        tasks = account.list_tasks(ACCOUNT_BASE, _account_token(),
+                                   AUTOCLAW_APP_VERSION, MANAGED_PLATFORM)
+    except account.AccountError as error:
+        return _cors(jsonify({"ok": False, "message": str(error),
+                              "code": error.code})), 400
+    except Exception as error:
+        return _cors(jsonify({"ok": False, "message": str(error)})), 500
+    return _cors(jsonify({"ok": True, "tasks": tasks}))
+
+
 @app.route("/admin/api/overview", methods=["GET", "OPTIONS"])
 def admin_overview():
     if request.method == "OPTIONS":
@@ -611,11 +845,13 @@ def admin_overview():
         except Exception as error:
             info["notice"] = str(error)
     probe = dict(_probe_cache)
+    credits = _query_credits()
     return _cors(jsonify({
         "service": "AutoClaw2api",
         "credential": info,
         "cred_source": CRED_SOURCE,
         "oauth_available": _oauth_store is not None,
+        "credits": credits,
         "models": _list_models(),
         "probe": {"done": probe.get("done", 0), "total": probe.get("total", 0),
                   "unavailable": probe.get("unavailable", 0),
@@ -633,12 +869,16 @@ def admin_overview():
     }))
 
 
-@app.route("/admin/api/oauth/send-code", methods=["POST", "OPTIONS"])
-def admin_oauth_send_code():
-    """OAuth 登录第一步：给手机号发验证码。
+@app.route("/admin/api/oauth/begin", methods=["POST", "OPTIONS"])
+def admin_oauth_begin():
+    """OAuth 授权第一步：起 loopback、取授权链接。
 
-    只在 ``AUTOCLAW_CRED_SOURCE=oauth`` 下可用。**会真的发一条短信**，
-    所以这个端点故意不做成幂等的静默操作——面板上点之前有确认。
+    返回的 ``url`` 由面板交给用户打开（或直接跳转）。真正收 code 的是
+    ``http://localhost:{port}/auth/callback-{provider}``——端口与路径都从
+    main.cjs 的 loopback 实现里抄的，不是自己定的。
+
+    这里**不阻塞**：授权要用户在浏览器里操作，可能几十秒。所以只起流程、
+    存句柄，由 ``status`` 端点轮询结果，``wait`` 端点做最终收尾。
     """
     if request.method == "OPTIONS":
         return _cors(Response(""))
@@ -650,50 +890,71 @@ def admin_oauth_send_code():
                               "message": "当前不是 oauth 凭据源（AUTOCLAW_CRED_SOURCE=%s）"
                                          % CRED_SOURCE})), 400
     body = request.get_json(silent=True) or {}
-    phone = str(body.get("phone") or "").strip()
-    if not phone.isdigit() or len(phone) < 5:
-        return _cors(jsonify({"ok": False, "message": "phone 格式不对"})), 400
+    provider = str(body.get("provider") or "zai").strip().lower()
+    if provider not in oauth.OAUTH_HOSTS:
+        return _cors(jsonify({"ok": False,
+                              "message": "provider 只能是 %s"
+                                         % " / ".join(oauth.OAUTH_HOSTS)})), 400
+    if _oauth_flow is not None and _oauth_flow.get("thread") is not None \
+            and _oauth_flow["thread"].is_alive():
+        return _cors(jsonify({"ok": False,
+                              "message": "已有一个授权流程在进行中，先取消或等它完成"})), 409
+
+    flow = _oauth_store.flow(provider)
     try:
-        cooldown = oauth.send_code(
-            phone, _oauth_store._device_id, AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
-            autoclaw.APP_ID, autoclaw.APP_KEY)
+        url = flow.begin()
     except oauth.AuthError as error:
         return _cors(jsonify({"ok": False, "message": str(error),
                               "code": error.code})), 400
-    return _cors(jsonify({"ok": True, "message": "验证码已发送",
-                          "cooldown": cooldown, "phone": phone}))
+    # 起线程等回调：wait() 会阻塞到用户授权完成或超时，放在请求线程里会把
+    # 这个 HTTP 连接挂死十分钟。线程只负责等 + 换 token，结果写进 _oauth_flow。
+    thread = threading.Thread(target=_oauth_wait_worker, args=(flow,), daemon=True)
+    _oauth_flow.clear()
+    _oauth_flow.update({"flow": flow, "url": url, "provider": provider,
+                        "thread": thread, "state": "waiting", "error": None,
+                        "cred": None, "startedAt": time.time()})
+    thread.start()
+    logger.info("OAuth 授权已开始: provider=%s port=%s", provider, flow._port)
+    return _cors(jsonify({"ok": True, "url": url, "provider": provider,
+                          "port": flow._port,
+                          "expiresIn": oauth.OAUTH_ATTEMPT_TIMEOUT_S}))
 
 
-@app.route("/admin/api/oauth/login", methods=["POST", "OPTIONS"])
-def admin_oauth_login():
-    """OAuth 登录第二步：验证码换 token，DPAPI 加密后落盘。"""
+@app.route("/admin/api/oauth/status", methods=["POST", "OPTIONS"])
+def admin_oauth_status():
+    """轮询授权流程状态。面板用这个把进度显示出来。"""
     if request.method == "OPTIONS":
         return _cors(Response(""))
     denied = _guard()
     if denied:
         return denied
-    if _oauth_store is None:
-        return _cors(jsonify({"ok": False,
-                              "message": "当前不是 oauth 凭据源（AUTOCLAW_CRED_SOURCE=%s）"
-                                         % CRED_SOURCE})), 400
-    body = request.get_json(silent=True) or {}
-    phone = str(body.get("phone") or "").strip()
-    code = str(body.get("code") or "").strip()
-    try:
-        cred = oauth.login(phone, code, _oauth_store._device_id,
-                           AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
-                           autoclaw.APP_ID, autoclaw.APP_KEY)
-    except oauth.AuthError as error:
-        return _cors(jsonify({"ok": False, "message": str(error),
-                              "code": error.code})), 400
-    _oauth_store.save_login(cred)
-    logger.info("OAuth 登录成功: phone=%s exp=%s",
-                _mask_phone(phone), autoclaw._fmt_exp(cred["accessToken"]))
-    return _cors(jsonify({
-        "ok": True, "message": "登录成功，凭据已加密存到 %s" % _oauth_store.path,
-        "token_exp": autoclaw._fmt_exp(cred["accessToken"]),
-        "has_refresh": bool(cred.get("refreshToken")),
-    }))
+    if not _oauth_flow or _oauth_flow.get("state") is None:
+        return _cors(jsonify({"ok": True, "state": "idle"}))
+    payload = {"ok": True, "state": _oauth_flow["state"],
+               "provider": _oauth_flow.get("provider"),
+               "url": _oauth_flow.get("url")}
+    if _oauth_flow.get("error"):
+        payload["error"] = _oauth_flow["error"]
+        payload["code"] = _oauth_flow.get("code")
+    if _oauth_flow.get("cred"):
+        payload["token_exp"] = autoclaw._fmt_exp(_oauth_flow["cred"]["accessToken"])
+        payload["has_refresh"] = bool(_oauth_flow["cred"].get("refreshToken"))
+    return _cors(jsonify(payload))
+
+
+@app.route("/admin/api/oauth/cancel", methods=["POST", "OPTIONS"])
+def admin_oauth_cancel():
+    """放弃进行中的授权：关掉 loopback，让等待中的线程退出。"""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    flow = _oauth_flow.get("flow")
+    if flow is not None:
+        flow.cancel()
+    _oauth_flow.update({"state": "cancelled"})
+    return _cors(jsonify({"ok": True, "message": "已取消"}))
 
 
 @app.route("/admin/api/refresh-token", methods=["POST", "OPTIONS"])

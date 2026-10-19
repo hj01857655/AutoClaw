@@ -28,6 +28,14 @@ dumps/
 *.req.txt
 *.resp.txt
 
+# --- 一次性诊断产物（排障现场，含本机 device_id / 上游响应原文，不入库）---
+work/
+AutoClaw2api/work/
+
+# --- OAuth 自换凭据（AUTOCLAW_CRED_SOURCE=oauth 时写入 .cred/，
+#     DPAPI 加密，只在本机本 Windows 用户下解得出；仍然不入库）---
+.cred/
+
 # --- Chromium profile 与加密凭据（本仓库只存解密方法，不存密文）---
 Local State
 Cookies

@@ -61,12 +61,24 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
 .badge.ok{background:rgba(22,163,74,.12);color:#15803d;border-color:rgba(22,163,74,.3)}
 .badge.bad{background:rgba(220,38,38,.1);color:#b91c1c;border-color:rgba(220,38,38,.28)}
 .badge.info{background:rgba(15,118,110,.1);color:#0f766e;border-color:rgba(15,118,110,.28)}
+.badge:not(.ok):not(.bad):not(.info){background:rgba(100,116,139,.08);color:var(--muted);border-color:rgba(100,116,139,.25)}
 .mono{font-family:var(--font-mono);font-size:12px}
 .muted{color:var(--muted)}
 .chips{display:flex;flex-wrap:wrap;gap:6px;max-height:320px;overflow:auto}
 .chip{background:rgba(255,255,255,.8);border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:12px;color:var(--muted);font-family:var(--font-mono);white-space:nowrap}
 .chip.dead{border-color:rgba(220,38,38,.3);color:#b91c1c;background:rgba(220,38,38,.05);text-decoration:line-through}
 .chip.alive{border-color:rgba(22,163,74,.3);color:#15803d;background:rgba(22,163,74,.05)}
+.sub-h{color:var(--muted);font-size:12px;font-weight:600;margin:0 0 2px}
+.rows{display:flex;flex-direction:column}
+.row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:7px 0;border-bottom:1px solid rgba(100,116,139,.15)}
+.row:last-child{border-bottom:none}
+.row .t{font-size:13px;min-width:0;line-height:1.4}
+.row .d{font-size:11px;color:var(--muted);font-family:var(--font-mono);margin-top:2px;word-break:break-all}
+.row .side{text-align:right;white-space:nowrap;flex:none}
+.row .a{font-weight:700;font-variant-numeric:tabular-nums;margin-top:3px}
+.row .a.plus{color:var(--ok)}
+.row .a.minus{color:var(--bad)}
+.btn.mini{padding:4px 10px;font-size:12px}
 .inp{border:1px solid var(--line);background:rgba(255,255,255,.8);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font:inherit;font-family:var(--font-mono);font-size:13px}
 .inp:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-color:color-mix(in srgb,var(--accent) 55%,var(--line))}
 .inp::placeholder{color:#94A3B8}
@@ -98,6 +110,8 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
     </div>
     <div class="actions">
       <button class="btn" id="btnRefresh">刷新状态</button>
+      <button class="btn" id="btnCheckin">领当日积分</button>
+      <button class="btn" id="btnAccountDetail">积分任务与流水</button>
       <button class="btn" id="btnSelfCheck">门禁自检</button>
       <button class="btn" id="btnProbe">探测可调性</button>
       <button class="btn primary" id="btnToken">重新解密凭据</button>
@@ -111,7 +125,7 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
       <div class="sub" id="sCredSub"></div>
     </div>
     <div class="stat">
-      <div class="k">账号</div>
+      <div class="k">账号 · 积分</div>
       <div class="v" id="sAccount">—</div>
       <div class="sub" id="sAccountSub"></div>
     </div>
@@ -153,6 +167,29 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
     </div>
   </div>
 
+  <div class="card" id="accountCard" style="display:none">
+    <div class="card-h"><h2>积分任务</h2><span class="muted mono" id="taskSummary"></span></div>
+    <div class="card-b"><div id="taskList"><div class="muted">加载中…</div></div></div>
+  </div>
+
+  <div class="card" id="ledgerCard" style="display:none">
+    <div class="card-h">
+      <h2>积分流水</h2>
+      <span class="muted mono" id="ledgerPage"></span>
+    </div>
+    <div class="card-b">
+      <div class="note" style="margin-bottom:8px">
+        流水里的 <code>actual_model</code> / <code>autoclaw_model_mode</code> 是上游记账的模型与模式，
+        所以它同时能回答「刚才那次对话花了多少分、走的哪个模型」。
+      </div>
+      <div id="ledgerList"><div class="muted">加载中…</div></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn mini" id="btnLedgerPrev">上一页</button>
+        <button class="btn mini" id="btnLedgerNext">下一页</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="card-h"><h2>模型列表</h2><span class="muted" id="modelCount"></span></div>
     <div class="card-b"><div class="chips" id="modelChips"></div></div>
@@ -170,19 +207,25 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
   </div>
 
   <div class="card" id="oauthCard" style="display:none">
-    <div class="card-h"><h2>手机验证码登录</h2><span class="muted" id="oauthHint"></span></div>
+    <div class="card-h"><h2>账号授权登录</h2><span class="muted" id="oauthHint"></span></div>
     <div class="card-b">
       <div class="note" style="margin-bottom:10px">
-        用验证码自己换 token，不依赖桌面端。换到的 token 经 DPAPI 加密后存在
-        <code>.cred/</code>，只在本机、本 Windows 用户下解得出；到期自动用 refreshToken 续。
+        走账号面开放的 OAuth：点按钮拿授权链接，浏览器里登录授权后回调收 code 换 token，
+        不依赖桌面端。换到的 token 经 DPAPI 加密后存在 <code>.cred/</code>，
+        只在本机、本 Windows 用户下解得出；到期自动用 refreshToken 续。
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <input id="oauthPhone" class="inp" placeholder="手机号" inputmode="numeric" style="width:180px"/>
-        <button class="btn" id="btnSendCode">发送验证码</button>
-        <input id="oauthCode" class="inp" placeholder="验证码" inputmode="numeric" style="width:120px"/>
-        <button class="btn primary" id="btnOauthLogin">登录</button>
+        <select id="oauthProvider" class="inp" style="width:150px">
+          <option value="zai">智谱账号（国内）</option>
+          <option value="google">Google 账号</option>
+        </select>
+        <button class="btn primary" id="btnOauthBegin">获取授权链接</button>
+        <button class="btn" id="btnOauthCancel" style="display:none">取消</button>
       </div>
       <div class="note" id="oauthStatus" style="margin-top:10px"></div>
+      <div id="oauthLink" style="margin-top:10px;display:none">
+        <a id="oauthUrl" href="#" target="_blank" rel="noopener noreferrer"></a>
+      </div>
     </div>
   </div>
 
@@ -223,6 +266,20 @@ async function api(path, opts={}){
   return data;
 }
 
+// 账号格子的副标题：积分 + 凭据更新时间。
+// 查不到余额时明说"查不到"，不显示 0——余额为 0 和查不到是两件事。
+function creditsSub(credits, updatedAt){
+  const when = updatedAt ? " · 凭据 " + String(updatedAt).slice(0,19).replace("T"," ") : "";
+  if (!credits || !credits.available) return "积分查不到" + when;
+  const view = (credits.wallets && credits.wallets[0] && credits.wallets[0].view) || credits.total;
+  let s = "积分 " + view;
+  // 有过期积分时补一句，否则用户看到余额掉下去只会以为号出问题了
+  if (credits.expiring && credits.expiring.expiring){
+    s += " · " + credits.expiring.expiring + " 分" + (credits.expiring.when || "") + "过期";
+  }
+  return s + when;
+}
+
 function render(data){
   const cred = data.credential || {};
   const models = data.models || [];
@@ -233,7 +290,7 @@ function render(data){
     : '<span class="badge bad">不可用</span>';
   $("sCredSub").textContent = cred.token_exp || "";
   $("sAccount").textContent = cred.account ? cred.account.slice(0,10) + "…" : "—";
-  $("sAccountSub").textContent = cred.updatedAt ? "更新于 " + String(cred.updatedAt).slice(0,19).replace("T"," ") : "";
+  $("sAccountSub").textContent = creditsSub(data.credits, cred.updatedAt);
   $("sModels").textContent = models.length;
   $("sModelsSub").textContent = valid ? "上游目录已拉取" : "目录不可用";
 
@@ -277,8 +334,8 @@ function render(data){
   $("urlResponses").textContent = origin + "/v1/responses";
   $("subTitle").textContent = (valid ? "凭证有效" : "凭证不可用") + " · " + models.length + " 模型";
 
-  // 凭据来源：desktop = 解密桌面端密文；oauth = 自己验证码换的
-  const src = data.cred_source === "oauth" ? "oauth（手机验证码自换）" : "desktop（解密桌面端凭据）";
+  // 凭据来源：desktop = 解密桌面端密文；oauth = 自己走 OAuth 授权换的
+  const src = data.cred_source === "oauth" ? "oauth（账号授权自换）" : "desktop（解密桌面端凭据）";
   $("credSource").textContent = src;
   $("oauthCard").style.display = data.oauth_available ? "" : "none";
   if (data.oauth_available){
@@ -286,43 +343,71 @@ function render(data){
   }
 }
 
-// ── OAuth 登录 ──────────────────────────────────────────────────────
-$("btnSendCode").onclick = async () => {
-  const phone = $("oauthPhone").value.trim();
-  if (!/^\d{5,}$/.test(phone)){ toast("先填手机号", false); return; }
-  if (!confirm("向 " + phone + " 发送验证码？会真的发一条短信。")) return;
-  $("btnSendCode").disabled = true;
+// ── OAuth 账号授权 ────────────────────────────────────────────────────
+let oauthPollTimer = null;
+
+function oauthStopPoll(){
+  if (oauthPollTimer){ clearInterval(oauthPollTimer); oauthPollTimer = null; }
+  $("btnOauthBegin").disabled = false;
+  $("btnOauthCancel").style.display = "none";
+}
+
+async function oauthPoll(){
+  let d;
   try {
-    const d = await api("/admin/api/oauth/send-code", {method:"POST", body: JSON.stringify({phone})});
-    $("oauthStatus").textContent = "验证码已发送，" + (d.cooldown || 60) + "s 内不能重发";
-    toast(d.message);
-    $("oauthCode").focus();
+    d = await api("/admin/api/oauth/status", {method:"POST", body: "{}"});
   } catch(e){
-    $("oauthStatus").textContent = "发送失败：" + e.message;
+    return;                      // 网络抖动就等下一拍，别把轮询打断
+  }
+  const state = d.state;
+  if (state === "ok"){
+    oauthStopPoll();
+    $("oauthStatus").textContent = "授权成功，token 已加密存到 .cred/（" + (d.token_exp || "") + "）";
+    $("oauthLink").style.display = "none";
+    $("oauthHint").textContent = "已登录";
+    toast("授权成功");
+    await loadOverview();
+  } else if (state === "failed"){
+    oauthStopPoll();
+    $("oauthStatus").textContent = "授权失败：" + d.error;
+    $("oauthLink").style.display = "none";
+    toast(d.error, false);
+  } else if (state === "cancelled"){
+    oauthStopPoll();
+    $("oauthStatus").textContent = "已取消";
+    $("oauthLink").style.display = "none";
+  }
+  // waiting 就什么都不做，等下一拍
+}
+
+$("btnOauthBegin").onclick = async () => {
+  const provider = $("oauthProvider").value;
+  $("btnOauthBegin").disabled = true;
+  $("btnOauthCancel").style.display = "";
+  try {
+    const d = await api("/admin/api/oauth/begin", {method:"POST", body: JSON.stringify({provider})});
+    const link = $("oauthUrl");
+    link.href = d.url;
+    link.textContent = d.url;
+    $("oauthLink").style.display = "";
+    $("oauthStatus").textContent =
+      "请在浏览器里完成授权（" + d.expiresIn + " 秒内有效），完成后这里会自动更新。";
+    oauthPollTimer = setInterval(oauthPoll, 1500);
+  } catch(e){
+    $("btnOauthBegin").disabled = false;
+    $("btnOauthCancel").style.display = "none";
+    $("oauthStatus").textContent = "获取授权链接失败：" + e.message;
     toast(e.message, false);
-  } finally {
-    $("btnSendCode").disabled = false;
   }
 };
 
-$("btnOauthLogin").onclick = async () => {
-  const phone = $("oauthPhone").value.trim();
-  const code = $("oauthCode").value.trim();
-  if (!phone || !code){ toast("手机号和验证码都要填", false); return; }
-  $("btnOauthLogin").disabled = true;
+$("btnOauthCancel").onclick = async () => {
   try {
-    const d = await api("/admin/api/oauth/login", {method:"POST", body: JSON.stringify({phone, code})});
-    $("oauthStatus").textContent = d.message + "（" + (d.token_exp || "") + "）";
-    $("oauthHint").textContent = "已登录";
-    $("oauthCode").value = "";
-    toast(d.message);
-    await loadOverview();
-  } catch(e){
-    $("oauthStatus").textContent = "登录失败：" + e.message;
-    toast(e.message, false);
-  } finally {
-    $("btnOauthLogin").disabled = false;
-  }
+    await api("/admin/api/oauth/cancel", {method:"POST", body: "{}"});
+  } catch(e){ /* 取消失败也照样把本地轮询停掉，别留个停不下来的定时器 */ }
+  oauthStopPoll();
+  $("oauthStatus").textContent = "已取消";
+  $("oauthLink").style.display = "none";
 };
 
 function renderChecks(data){
@@ -340,6 +425,107 @@ function renderChecks(data){
     : '<div class="muted">自检未返回结果</div>';
 }
 
+// ── 积分任务与流水 ────────────────────────────────────────────────────
+let ledgerPage = 1;
+
+// 每个任务一行。三种行尾状态：
+//   已完成        → 置灰 + 徽章，不给按钮
+//   未完成可领    → "领取"按钮
+//   未完成不可领  → 不给按钮，说明为什么（invite_friends / upgrade_pc_app 这种，
+//                    上游 client_triggered=false，点了也是白点）
+function renderTasks(tasks){
+  $("accountCard").style.display = "";
+  const list = tasks || [];
+  const claimable = list.filter(t => t.status !== "completed" && t.claimable);
+  $("taskSummary").textContent = list.length ? `${list.length} 项` : "";
+  if (!list.length){
+    $("taskList").innerHTML = '<div class="muted">没有可展示的任务</div>';
+    return;
+  }
+  $("taskList").innerHTML = list.map(t => {
+    const done = t.status === "completed";
+    let side;
+    if (done){
+      side = `<span class="badge info">已完成</span><div class="a muted">已领</div>`;
+    } else if (t.claimable){
+      side = `<button class="btn mini primary" data-claim="${escapeHtml(t.task_id)}">领取</button>
+              <div class="a plus">+${t.points}</div>`;
+    } else {
+      // 上游标了 client_triggered=false。这类任务要么得在别处做（邀请好友要去
+      // 分享链接、升级客户端要去装 PC 版），客户端硬点只会拿到一句"不支持"。
+      side = `<span class="badge">需另行完成</span>
+              <div class="a muted">+${t.points}</div>`;
+    }
+    return `
+      <div class="row">
+        <div class="t">
+          <div style="${done ? "color:var(--muted)" : ""}">${escapeHtml(t.title)}</div>
+          <div class="d">${escapeHtml(t.task_id)} · ${escapeHtml(t.type || "—")}</div>
+        </div>
+        <div class="side">${side}</div>
+      </div>`;
+  }).join("");
+  $("taskSummary").textContent = `${list.length} 项 · ${claimable.length} 项可领`;
+  for (const b of $("taskList").querySelectorAll("[data-claim]")){
+    b.onclick = () => claimOne(b, b.getAttribute("data-claim"));
+  }
+}
+
+async function claimOne(btn, taskId){
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "…";
+  try {
+    const d = await api("/admin/api/claim", {method:"POST", body: JSON.stringify({task_id: taskId})});
+    // rejected 用中性提示：这不是失败，是这个任务不该在这里领
+    toast(d.message || "已领取", !!(d.completed || d.already || d.rejected));
+    const {tasks} = await loadAccountDetail();
+    const left = (tasks.tasks || []).filter(t => t.status !== "completed" && t.claimable).length;
+    $("taskSummary").textContent = `${tasks.tasks.length} 项 · ${left} 项可领`;
+  } catch(e){
+    btn.disabled = false;
+    btn.textContent = old;
+    toast("领取失败: " + e.message, false);
+  }
+}
+
+function renderLedgers(entries, page, pageSize){
+  $("ledgerCard").style.display = "";
+  const list = entries || [];
+  $("ledgerPage").textContent = `第 ${page} 页`;
+  $("btnLedgerPrev").disabled = page <= 1;
+  // 不满一页说明没有下一页了，比让用户点出一个空列表好
+  $("btnLedgerNext").disabled = list.length < pageSize;
+  if (!list.length){
+    $("ledgerList").innerHTML = '<div class="muted">这一页没有流水</div>';
+    return;
+  }
+  $("ledgerList").innerHTML = list.map(e => {
+    const plus = e.amount >= 0;
+    const when = String(e.created_at || "").slice(0, 19).replace("T", " ");
+    const bits = [e.description, e.model && (e.mode ? `${e.model} · ${e.mode}` : e.model)]
+      .filter(Boolean).join(" · ");
+    return `
+      <div class="row">
+        <div class="t">
+          <div>${escapeHtml(bits || e.kind || "—")}</div>
+          <div class="d">${escapeHtml(when)} · ${escapeHtml(e.wallet || "—")}</div>
+        </div>
+        <div class="side"><div class="a ${plus ? "plus" : "minus"}">${plus ? "+" : ""}${e.amount}</div></div>
+      </div>`;
+  }).join("");
+}
+
+async function loadAccountDetail(){
+  const [tasks, ledgers] = await Promise.all([
+    api("/admin/api/tasks"),
+    api(`/admin/api/ledgers?page=${ledgerPage}&page_size=20`),
+  ]);
+  renderTasks(tasks.tasks || []);
+  renderLedgers(ledgers.entries || [], ledgerPage, 20);
+  return {tasks, ledgers};
+}
+
 async function loadOverview(){
   const data = await api("/admin/api/overview");
   render(data);
@@ -348,6 +534,55 @@ async function loadOverview(){
 
 $("btnRefresh").onclick = async () => {
   try { await loadOverview(); toast("已刷新"); } catch(e){ toast(e.message, false); }
+};
+
+// 顶栏的「领当日积分」是快捷入口——不展开任务卡片也能一键签到。
+// 走 /admin/api/claim 并显式指定 daily_signin，不依赖默认值。
+$("btnCheckin").onclick = async () => {
+  $("btnCheckin").disabled = true;
+  try {
+    const data = await api("/admin/api/claim",
+      {method:"POST", body: JSON.stringify({task_id: "daily_signin"})});
+    // 已签过也是正常结果，别用红色提示
+    toast(data.message || "已领取", !!(data.completed || data.already));
+    await loadOverview();
+  } catch(e){
+    toast("领取失败: " + e.message, false);
+  } finally {
+    $("btnCheckin").disabled = false;
+  }
+};
+
+$("btnAccountDetail").onclick = async () => {
+  $("btnAccountDetail").disabled = true;
+  try {
+    const {tasks} = await loadAccountDetail();
+    const left = (tasks.tasks || []).filter(t => t.status !== "completed" && t.claimable).length;
+    toast(`已加载，${left} 项可领`);
+  } catch(e){
+    toast("加载失败: " + e.message, false);
+    $("accountCard").style.display = "";
+    $("taskList").innerHTML = '<div class="muted">加载失败：' + escapeHtml(e.message) + '</div>';
+  } finally {
+    $("btnAccountDetail").disabled = false;
+  }
+};
+
+$("btnLedgerPrev").onclick = async () => {
+  if (ledgerPage <= 1) return;
+  ledgerPage -= 1;
+  $("btnLedgerPrev").disabled = true;
+  try { await loadAccountDetail(); }
+  catch(e){ toast("翻页失败: " + e.message, false); }
+  finally { $("btnLedgerPrev").disabled = false; }
+};
+
+$("btnLedgerNext").onclick = async () => {
+  ledgerPage += 1;
+  $("btnLedgerNext").disabled = true;
+  try { await loadAccountDetail(); }
+  catch(e){ toast("翻页失败: " + e.message, false); }
+  finally { $("btnLedgerNext").disabled = false; }
 };
 
 $("btnSelfCheck").onclick = async () => {

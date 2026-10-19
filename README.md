@@ -123,19 +123,98 @@ AutoClaw2api/
   它证明的是「反代会怎么做」，不等于「上游会接受」。
 - **探测可调性** —— 逐模型发极小请求实测。`pay-view` 是账号配额的分钟级波动，
   所以「目录里有」不等于「现在能调」，只有实调能区分。结果会缓存并进 overview。
+- **积分任务与流水** —— 列任务、逐项领取、翻页看流水。见下面「账号面：积分」。
+- **账号授权登录**（OAuth）—— 仅在 `AUTOCLAW_CRED_SOURCE=oauth` 时出现。
 - **刷新状态 / 重新解密凭据** —— 后者仅在桌面端刚刷新登录态、而 mtime 检查
   恰好漏掉时用；正常情况下凭据按 mtime 热重载，自动跟随。
 
 | 接口 | 用途 |
 |---|---|
 | `GET /health` | 凭据状态、token 剩余有效期、当前模型目录 |
-| `GET /admin/api/overview` | 凭据 + 模型 + probe 缓存 + 当前生效的约束 |
+| `GET /admin/api/overview` | 凭据 + 模型 + probe 缓存 + 当前生效的约束 + 积分 |
 | `POST /admin/api/self-check` | 门禁自检（不出网） |
 | `POST /admin/api/probe-models` | 逐模型实测可调性 |
 | `POST /admin/api/refresh-token` | 强制重新解密凭据 |
+| `GET /admin/api/credits` | 积分余额（含即将过期的积分） |
+| `GET /admin/api/tasks` | 任务列表，每项带 `claimable` |
+| `POST /admin/api/claim` | 领指定任务的积分，body `{"task_id":"..."}` |
+| `GET /admin/api/ledgers` | 积分流水，`?page=1&page_size=20` |
+| `POST /admin/api/oauth/begin` | OAuth 模式：取授权链接 |
+| `POST /admin/api/oauth/status` | OAuth 模式：轮询授权结果 |
+| `POST /admin/api/oauth/cancel` | OAuth 模式：取消本次授权 |
+
+> **OAuth 模式当前未打通**：`oauth-url` 在账号面返回业务码 `631000`
+> （「抱歉, 登录失败,请重新尝试」），拿不到授权链接，浏览器那一步无从开始。
+> 请求形状已与桌面端 2.1.0 `main.cjs` 逐字段对齐——body（`navigate_uri` +
+> `source_id` + `device_id`）、managed 头全集、`X-Auth-Sign = md5(appId & ts & appKey)`、
+> 秒级时间戳、loopback 端口与路径、UA——并用 Node 原生 fetch（与 Electron 客户端同栈）
+> 复刻以排除 TLS 指纹；同一套签名头的 `oauth-captcha-config` 返回 `code:0`，
+> 说明身份与签名无误，拒绝只发生在两个 `*-oauth-*` 业务端点本身。
+> `captcha-config` 返回 `region: "ga"` 是唯一异常信号：服务端可能把出口 IP 判成了
+> 非国内区域。已排除的假设见 `docs/autoclaw-10`。**桌面端凭据解密（默认 `desktop`
+> 模式）不受影响，是当前可用的凭据来源。**
 
 正常情况下**不需要**手动刷新：凭据按 mtime 热重载，桌面端刷新登录态后本服务
 自动跟随（TTL 5 分钟 + mtime 检查，成本是一次 stat）。
+
+---
+
+## 账号面：积分
+
+账号面的端点挂在**裸域名** `AUTOCLAW_ACCOUNT_BASE`
+（默认 `https://autoglm-acceleration-api.zhipuai.cn`），**不是** `UPSTREAM_BASE`——
+后者自带 `/autoclaw-proxy/proxy/autoclaw` 路径，而任务端点是该路径的**兄弟**：
+`/autoclaw-proxy/proxy/autoclaw-task-list`，中间没有 `autoclaw` 这一段。
+把 `UPSTREAM_BASE` 当 base 传进去会 404（实测）。
+
+### 两个签到接口，只有一个真的给分
+
+这一点反直觉，也是本模块唯一真正踩过的坑：
+
+| 接口 | 实测结果 |
+|---|---|
+| `POST /userapi/v1/user-info` | `code:0` 但 `completed:false`，**一分没给**。这是桌面端 `main.cjs` 的 `DAILY_CREDITS_CLAIM_PATH`，名正言顺却不生效 |
+| `POST /autoclaw-proxy/proxy/autoclaw-task-complete` | `{task_id:"daily_signin"}` → **200 分**，余额 22931 → 23131 |
+
+前者**没有代码错误**——`code:0`、HTTP 200、不抛异常，静悄悄地什么也不给。
+所以不要因为"文档说这是签到路径"就用它；本服务只实现后者。
+
+`/admin/api/claim` 的四种结果必须分开看，提示语完全不同：
+
+| 字段 | 含义 |
+|---|---|
+| `completed=true` | 真领到了 |
+| `already=true` | 今天已经领过了（服务端按天去重，幂等，**正常**） |
+| `rejected=true` | 服务端不认这个客户端触发（见下） |
+| 三者皆 false | 服务端没认这次请求（这才是真失败） |
+
+`rejected` 的响应形状也和成功时不一样：成功/已签过是 `{"data":{...}}`，
+而 `rejected` 是 **HTTP 400 + 顶层 `{"message":"任务不支持客户端触发"}`，没有 `data`**。
+所以解析时不能看到没有 `data` 就报"结构不对"——那会把已知的正常情况当故障。
+
+### 哪些任务客户端领不到
+
+任务列表每项带 `client_triggered`（本服务映射为 `claimable`）。当前为 `false` 的：
+
+| 任务 | 分数 | 为什么领不到 |
+|---|---|---|
+| `invite_friends` | 200 | 得真的去拉人注册 |
+| `upgrade_pc_app` | 300 | 得真的安装 PC 客户端 |
+
+这两个**不是 bug**，服务端就是这么设计的。面板据此不渲染「领取」按钮，
+而是显示「需另行完成」——不让用户点了再看报错。
+
+可领的两个是 `daily_signin`（200）和 `daily_inspiration_center`（200）。
+
+### 余额与流水
+
+- `GET /admin/api/credits` —— 查不到时返回 `{"available": false, "error": ...}`，
+  **绝不返回 0**。「余额查不到」和「余额是 0」对用户是两件事，混成 0 会让人以为号废了。
+  面板同样显示「积分查不到」而不是 0。
+- `GET /admin/api/ledgers` —— 每条带 `metadata.actual_model` 与
+  `metadata.autoclaw_model_mode`，所以它不只是账本，还能回答
+  「刚才那次对话花了多少分、走的哪个模型」。时间字段是 **`occurred_at`**
+  （不是 `created_at`——响应里根本没有后者的键，取错了时间列会全空）。
 
 ---
 
@@ -150,6 +229,8 @@ AutoClaw2api/
 | `AUTOCLAW_BASE` | `%APPDATA%/AutoClaw-official` | 用户数据根 |
 | `AUTOCLAW_ACCOUNT` | 自动 | 多账号时指定账号目录 |
 | `AUTOCLAW_DEFAULT_MODEL` | `zai_auto` | 客户端没填 `model` 时补的档位 |
+| `AUTOCLAW_CRED_SOURCE` | `desktop` | `desktop` = 解密桌面端密文；`oauth` = 自己走 OAuth 换 token（存 `.cred/`，DPAPI 加密）。选 `oauth` 时桌面端那份仍只读、不碰 |
+| `AUTOCLAW_ACCOUNT_BASE` | `https://autoglm-acceleration-api.zhipuai.cn` | 账号面积分/任务端点的 **base（裸域名）**。与 `AUTOCLAW_UPSTREAM_BASE` 不是一回事，见下面「账号面」 |
 | `DUMP` | `1` | 是否落盘请求/响应原文到 `dumps/` |
 
 **凭据不落在任何配置文件里**——一律从桌面端密文现场解密，`dumps/` 也绝不记录
