@@ -45,6 +45,7 @@ from flask import Flask, Response, g, jsonify, request
 load_dotenv()
 
 from lanes import autoclaw
+from lanes import oauth
 from adapters import anthropic as ab
 
 LISTEN_HOST = os.getenv("HOST", "127.0.0.1")
@@ -127,11 +128,36 @@ def _guard():
 
 
 # ── 凭据 ─────────────────────────────────────────────────────────────
+# 两种来源，按 AUTOCLAW_CRED_SOURCE 选：
+#
+#   desktop（默认）  解密桌面端的 DPAPI 密文。要同机、同 Windows 用户、装桌面端，
+#                    桌面端退出登录就断。
+#   oauth            自己走手机验证码登录，token 用 DPAPI 加密后存本地。
+#                    不依赖桌面端，与其余六个 2api 的凭据方式一致。
+#
+# 选 oauth 时 desktop 那份仍然只读、不碰，两者可以并存——想切回去改环境变量即可。
+CRED_SOURCE = os.getenv("AUTOCLAW_CRED_SOURCE", "desktop").strip().lower()
+_OAUTH_DIR = os.environ.get("AUTOCLAW_OAUTH_DIR", "") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".cred")
+
 _store = autoclaw.CredentialStore(AUTOCLAW_BASE, AUTOCLAW_ACCOUNT)
+_oauth_store = oauth.OAuthCredentialStore(
+    _OAUTH_DIR, AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
+    autoclaw.APP_ID, autoclaw.APP_KEY) if CRED_SOURCE == "oauth" else None
 
 
 def _token() -> str:
+    if _oauth_store is not None:
+        return _oauth_store.get()
     return _store.get()["accessToken"]
+
+
+def _mask_phone(phone: str) -> str:
+    """手机号打码后进日志。日志会被翻出来排障，别留完整号码。"""
+    phone = str(phone or "")
+    if len(phone) < 7:
+        return "***"
+    return phone[:3] + "****" + phone[-4:]
 
 
 DUMP_DIR = os.environ.get("DUMP_DIR", "") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dumps")
@@ -563,20 +589,33 @@ def admin_overview():
     info = {"valid": False, "account": "", "token_exp": "", "notice": "",
             "upstream": UPSTREAM_BASE, "app_version": AUTOCLAW_APP_VERSION,
             "platform": MANAGED_PLATFORM}
-    try:
-        cred = _store.get()
-        info.update({
-            "valid": True,
-            "account": cred["account"][:12],
-            "token_exp": autoclaw._fmt_exp(cred["accessToken"]),
-            "updatedAt": cred.get("updatedAt") or "",
-        })
-    except Exception as error:
-        info["notice"] = str(error)
+    if _oauth_store is not None:
+        # OAuth 模式：账号面自己换的 token，没有桌面端那个 account 目录概念
+        try:
+            token = _oauth_store.get()
+            info.update({"valid": True, "account": "oauth",
+                        "token_exp": autoclaw._fmt_exp(token),
+                        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                   time.localtime())})
+        except Exception as error:
+            info["notice"] = str(error)
+    else:
+        try:
+            cred = _store.get()
+            info.update({
+                "valid": True,
+                "account": cred["account"][:12],
+                "token_exp": autoclaw._fmt_exp(cred["accessToken"]),
+                "updatedAt": cred.get("updatedAt") or "",
+            })
+        except Exception as error:
+            info["notice"] = str(error)
     probe = dict(_probe_cache)
     return _cors(jsonify({
         "service": "AutoClaw2api",
         "credential": info,
+        "cred_source": CRED_SOURCE,
+        "oauth_available": _oauth_store is not None,
         "models": _list_models(),
         "probe": {"done": probe.get("done", 0), "total": probe.get("total", 0),
                   "unavailable": probe.get("unavailable", 0),
@@ -594,6 +633,69 @@ def admin_overview():
     }))
 
 
+@app.route("/admin/api/oauth/send-code", methods=["POST", "OPTIONS"])
+def admin_oauth_send_code():
+    """OAuth 登录第一步：给手机号发验证码。
+
+    只在 ``AUTOCLAW_CRED_SOURCE=oauth`` 下可用。**会真的发一条短信**，
+    所以这个端点故意不做成幂等的静默操作——面板上点之前有确认。
+    """
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    if _oauth_store is None:
+        return _cors(jsonify({"ok": False,
+                              "message": "当前不是 oauth 凭据源（AUTOCLAW_CRED_SOURCE=%s）"
+                                         % CRED_SOURCE})), 400
+    body = request.get_json(silent=True) or {}
+    phone = str(body.get("phone") or "").strip()
+    if not phone.isdigit() or len(phone) < 5:
+        return _cors(jsonify({"ok": False, "message": "phone 格式不对"})), 400
+    try:
+        cooldown = oauth.send_code(
+            phone, _oauth_store._device_id, AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
+            autoclaw.APP_ID, autoclaw.APP_KEY)
+    except oauth.AuthError as error:
+        return _cors(jsonify({"ok": False, "message": str(error),
+                              "code": error.code})), 400
+    return _cors(jsonify({"ok": True, "message": "验证码已发送",
+                          "cooldown": cooldown, "phone": phone}))
+
+
+@app.route("/admin/api/oauth/login", methods=["POST", "OPTIONS"])
+def admin_oauth_login():
+    """OAuth 登录第二步：验证码换 token，DPAPI 加密后落盘。"""
+    if request.method == "OPTIONS":
+        return _cors(Response(""))
+    denied = _guard()
+    if denied:
+        return denied
+    if _oauth_store is None:
+        return _cors(jsonify({"ok": False,
+                              "message": "当前不是 oauth 凭据源（AUTOCLAW_CRED_SOURCE=%s）"
+                                         % CRED_SOURCE})), 400
+    body = request.get_json(silent=True) or {}
+    phone = str(body.get("phone") or "").strip()
+    code = str(body.get("code") or "").strip()
+    try:
+        cred = oauth.login(phone, code, _oauth_store._device_id,
+                           AUTOCLAW_APP_VERSION, MANAGED_PLATFORM,
+                           autoclaw.APP_ID, autoclaw.APP_KEY)
+    except oauth.AuthError as error:
+        return _cors(jsonify({"ok": False, "message": str(error),
+                              "code": error.code})), 400
+    _oauth_store.save_login(cred)
+    logger.info("OAuth 登录成功: phone=%s exp=%s",
+                _mask_phone(phone), autoclaw._fmt_exp(cred["accessToken"]))
+    return _cors(jsonify({
+        "ok": True, "message": "登录成功，凭据已加密存到 %s" % _oauth_store.path,
+        "token_exp": autoclaw._fmt_exp(cred["accessToken"]),
+        "has_refresh": bool(cred.get("refreshToken")),
+    }))
+
+
 @app.route("/admin/api/refresh-token", methods=["POST", "OPTIONS"])
 def admin_refresh_token():
     """强制重新解密凭据（桌面端刚刷新登录态时用；正常情况下按 mtime 自动跟随）。"""
@@ -603,6 +705,11 @@ def admin_refresh_token():
     if denied:
         return denied
     try:
+        if _oauth_store is not None:
+            _oauth_store.invalidate()
+            token = _oauth_store.get()
+            return _cors(jsonify({"ok": True, "message": "OAuth 凭据已重新载入",
+                                  "token_exp": autoclaw._fmt_exp(token)}))
         _store.invalidate()
         cred = _store.get()
         return _cors(jsonify({"ok": True, "message": "凭据已重新解密",

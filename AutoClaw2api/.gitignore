@@ -6,3 +6,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# OAuth 凭据（DPAPI 密文 + device_id）。虽然解不开也别提交——device_id
+# 是账号面的稳定标识，泄露等于把「哪个设备登的」送给别人。
+.cred/

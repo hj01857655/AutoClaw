@@ -67,6 +67,9 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
 .chip{background:rgba(255,255,255,.8);border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:12px;color:var(--muted);font-family:var(--font-mono);white-space:nowrap}
 .chip.dead{border-color:rgba(220,38,38,.3);color:#b91c1c;background:rgba(220,38,38,.05);text-decoration:line-through}
 .chip.alive{border-color:rgba(22,163,74,.3);color:#15803d;background:rgba(22,163,74,.05)}
+.inp{border:1px solid var(--line);background:rgba(255,255,255,.8);color:var(--text);padding:8px 11px;border-radius:var(--radius-sm);font:inherit;font-family:var(--font-mono);font-size:13px}
+.inp:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-color:color-mix(in srgb,var(--accent) 55%,var(--line))}
+.inp::placeholder{color:#94A3B8}
 .check{display:flex;align-items:flex-start;gap:10px;padding:9px 0;border-bottom:1px solid rgba(100,116,139,.15)}
 .check:last-child{border-bottom:none}
 .check .mark{flex:none;width:18px;height:18px;border-radius:6px;display:grid;place-items:center;font-size:12px;font-weight:800;color:#fff;margin-top:1px}
@@ -162,6 +165,24 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
       <div class="kv"><span class="k">Anthropic Messages</span><span class="v mono" id="urlAnthropic">—</span></div>
       <div class="kv"><span class="k">OpenAI Responses</span><span class="v mono" id="urlResponses">—</span></div>
       <div class="kv"><span class="k">模型名</span><span class="v muted" id="modelNote">从上面的目录里挑，原样透传给上游</span></div>
+      <div class="kv"><span class="k">凭据来源</span><span class="v muted" id="credSource">—</span></div>
+    </div>
+  </div>
+
+  <div class="card" id="oauthCard" style="display:none">
+    <div class="card-h"><h2>手机验证码登录</h2><span class="muted" id="oauthHint"></span></div>
+    <div class="card-b">
+      <div class="note" style="margin-bottom:10px">
+        用验证码自己换 token，不依赖桌面端。换到的 token 经 DPAPI 加密后存在
+        <code>.cred/</code>，只在本机、本 Windows 用户下解得出；到期自动用 refreshToken 续。
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="oauthPhone" class="inp" placeholder="手机号" inputmode="numeric" style="width:180px"/>
+        <button class="btn" id="btnSendCode">发送验证码</button>
+        <input id="oauthCode" class="inp" placeholder="验证码" inputmode="numeric" style="width:120px"/>
+        <button class="btn primary" id="btnOauthLogin">登录</button>
+      </div>
+      <div class="note" id="oauthStatus" style="margin-top:10px"></div>
     </div>
   </div>
 
@@ -255,7 +276,54 @@ function render(data){
   $("urlAnthropic").textContent = origin + "/v1/messages";
   $("urlResponses").textContent = origin + "/v1/responses";
   $("subTitle").textContent = (valid ? "凭证有效" : "凭证不可用") + " · " + models.length + " 模型";
+
+  // 凭据来源：desktop = 解密桌面端密文；oauth = 自己验证码换的
+  const src = data.cred_source === "oauth" ? "oauth（手机验证码自换）" : "desktop（解密桌面端凭据）";
+  $("credSource").textContent = src;
+  $("oauthCard").style.display = data.oauth_available ? "" : "none";
+  if (data.oauth_available){
+    $("oauthHint").textContent = valid ? "已登录" : "未登录";
+  }
 }
+
+// ── OAuth 登录 ──────────────────────────────────────────────────────
+$("btnSendCode").onclick = async () => {
+  const phone = $("oauthPhone").value.trim();
+  if (!/^\d{5,}$/.test(phone)){ toast("先填手机号", false); return; }
+  if (!confirm("向 " + phone + " 发送验证码？会真的发一条短信。")) return;
+  $("btnSendCode").disabled = true;
+  try {
+    const d = await api("/admin/api/oauth/send-code", {method:"POST", body: JSON.stringify({phone})});
+    $("oauthStatus").textContent = "验证码已发送，" + (d.cooldown || 60) + "s 内不能重发";
+    toast(d.message);
+    $("oauthCode").focus();
+  } catch(e){
+    $("oauthStatus").textContent = "发送失败：" + e.message;
+    toast(e.message, false);
+  } finally {
+    $("btnSendCode").disabled = false;
+  }
+};
+
+$("btnOauthLogin").onclick = async () => {
+  const phone = $("oauthPhone").value.trim();
+  const code = $("oauthCode").value.trim();
+  if (!phone || !code){ toast("手机号和验证码都要填", false); return; }
+  $("btnOauthLogin").disabled = true;
+  try {
+    const d = await api("/admin/api/oauth/login", {method:"POST", body: JSON.stringify({phone, code})});
+    $("oauthStatus").textContent = d.message + "（" + (d.token_exp || "") + "）";
+    $("oauthHint").textContent = "已登录";
+    $("oauthCode").value = "";
+    toast(d.message);
+    await loadOverview();
+  } catch(e){
+    $("oauthStatus").textContent = "登录失败：" + e.message;
+    toast(e.message, false);
+  } finally {
+    $("btnOauthLogin").disabled = false;
+  }
+};
 
 function renderChecks(data){
   const checks = data.checks || [];
